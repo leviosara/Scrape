@@ -27,7 +27,6 @@ def make_naive(dt):
     return dt
 
 def find_date_in_url(url):
-    # Matches YYYY/MM/DD or YYYY-MM-DD
     patterns = [r'/(\d{4})/(\d{1,2})/(\d{1,2})/', r'/(\d{4})-(\d{1,2})-(\d{1,2})']
     for pat in patterns:
         match = re.search(pat, url)
@@ -37,10 +36,11 @@ def find_date_in_url(url):
             except: pass
     return None
 
-# --- SCANNING STRATEGIES (NO SLOW DOWNLOADS) ---
+# --- SCANNING STRATEGIES ---
 
-def scan_rss_feeds(base_url, log_box):
-    log_box.text("⏳ Step 1: Checking RSS Feeds...")
+def scan_rss_feeds(base_url, status_text, progress_bar):
+    status_text.text("⏳ Step 1/3: Checking RSS Feeds...")
+    progress_bar.progress(10)
     found = {}
     paths = [f"{base_url}/feed/", f"{base_url}/rss/", f"{base_url}/en/feed/", f"{base_url}/uk/feed/"]
     
@@ -57,40 +57,36 @@ def scan_rss_feeds(base_url, log_box):
                             dt = datetime(*published[:6])
                             found[link] = dt
                     if found:
-                        log_box.text(f"✅ RSS: Found {len(found)} articles.")
+                        status_text.text(f"✅ RSS: Found {len(found)} articles.")
                         return found
         except: continue
     return found
 
-def scan_sitemaps_fast(base_url, log_box):
-    log_box.text("⏳ Step 2: Scanning Sitemaps (Fast Mode)...")
+def scan_sitemaps_fast(base_url, status_text, progress_bar):
+    status_text.text("⏳ Step 2/3: Scanning Sitemaps...")
+    progress_bar.progress(30)
     domain = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
     
-    # We prioritize specific sitemaps that usually have dates
-    priority_paths = [
-        "/post-sitemap.xml", "/news-sitemap.xml", "/sitemap-news.xml",
-        "/sitemap.xml", "/sitemap_index.xml"
-    ]
-    
+    priority_paths = ["/post-sitemap.xml", "/news-sitemap.xml", "/sitemap.xml", "/sitemap_index.xml"]
     found = {}
     
-    for path in priority_paths:
+    for i, path in enumerate(priority_paths):
+        # Update UI to show we are trying different files
+        status_text.text(f"⏳ Step 2/3: Trying sitemap {i+1}/{len(priority_paths)}...")
+        
         try:
             r = requests.get(domain + path, timeout=3, headers={'User-Agent': USER_AGENT})
             if r.status_code != 200: continue
             
             root = ET.fromstring(r.content)
             
-            # If it's an index, we just grab the first few links to other sitemaps
             if 'sitemapindex' in str(root.tag).lower():
-                # Quick check: does the index list other sitemaps?
-                # We will just check the FIRST 3 child sitemaps found in the index
-                count = 0
+                # If it's an index, we check the first 3 children
+                child_count = 0
                 for child in root:
-                    if count >= 3: break # Strict limit for speed
+                    if child_count >= 3: break
                     loc = [c.text for c in child if 'loc' in str(c.tag).lower()]
                     if loc:
-                        # Fetch the child sitemap
                         try:
                             r2 = requests.get(loc[0], timeout=3, headers={'User-Agent': USER_AGENT})
                             if r2.status_code == 200:
@@ -103,7 +99,7 @@ def scan_sitemaps_fast(base_url, log_box):
                                             if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
                                         if url: found[url] = dt
                         except: pass
-                    count += 1
+                    child_count += 1
             
             elif 'urlset' in str(root.tag).lower():
                 for child in root:
@@ -113,17 +109,18 @@ def scan_sitemaps_fast(base_url, log_box):
                         if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
                     if url: found[url] = dt
             
-            # If we found items, we can stop checking other paths
-            if found:
-                break
+            # If we found stuff, stop early
+            if found: break
                 
         except: continue
         
-    log_box.text(f"✅ Sitemap: Found {len(found)} potential URLs.")
+    status_text.text(f"✅ Sitemap: Found {len(found)} potential URLs.")
+    progress_bar.progress(60)
     return found
 
-def scan_homepage(base_url, log_box):
-    log_box.text("⏳ Step 3: Scanning Homepage...")
+def scan_homepage(base_url, status_text, progress_bar):
+    status_text.text("⏳ Step 3/3: Scanning Homepage...")
+    progress_bar.progress(80)
     found = {}
     try:
         r = requests.get(base_url, timeout=5, headers={'User-Agent': USER_AGENT})
@@ -132,14 +129,11 @@ def scan_homepage(base_url, log_box):
         for link in links:
             full = urljoin(base_url, link)
             if urlparse(full).netloc == domain_netloc:
-                # Quick filter: Skip obvious non-articles
-                if not any(x in full.lower() for x in ['.jpg', '.png', '/tag/', '/category/', '/page/']):
-                    # We DO NOT download this link to check date. Too slow.
-                    # We only keep it if the URL has a date pattern.
+                if not any(x in full.lower() for x in ['.jpg', '.png', '/tag/', '/category/']):
                     if find_date_in_url(full):
                          found[full] = None
                          
-        log_box.text(f"✅ Homepage: Found {len(found)} links with dates in URL.")
+        status_text.text(f"✅ Homepage: Found {len(found)} links with dates in URL.")
     except: pass
     return found
 
@@ -148,38 +142,45 @@ def scan_homepage(base_url, log_box):
 def run_fast_analysis(url):
     cutoff = datetime.now() - timedelta(days=DAYS_TO_SCAN)
     
-    # 1. Gather Candidates
-    log_box = st.empty()
-    rss_articles = scan_rss_feeds(url, log_box)
-    sitemap_articles = scan_sitemaps_fast(url, log_box)
-    homepage_articles = scan_homepage(url, log_box)
+    # Create UI elements
+    status_text = st.empty()
+    progress_bar = st.progress(0)
     
-    # Merge: RSS > Sitemap > Homepage
+    # 1. Gather Candidates
+    rss_articles = scan_rss_feeds(url, status_text, progress_bar)
+    sitemap_articles = scan_sitemaps_fast(url, status_text, progress_bar)
+    homepage_articles = scan_homepage(url, status_text, progress_bar)
+    
+    # Merge
     all_candidates = homepage_articles.copy()
     all_candidates.update(sitemap_articles)
     all_candidates.update(rss_articles)
     
     candidates_list = list(all_candidates.items())
     
-    # 2. Verify Dates (Instant)
-    log_box.text(f"🔎 Filtering {len(candidates_list)} links...")
+    # 2. Verify Dates
+    status_text.text(f"🔎 Filtering {len(candidates_list)} links...")
+    progress_bar.progress(90)
     
     results = []
     
-    for link, known_date in candidates_list:
+    for i, (link, known_date) in enumerate(candidates_list):
+        # Mini progress update inside loop if huge list
+        if len(candidates_list) > 100 and i % 20 == 0:
+            pass # Avoid flickering too much, 90% is enough indicator
+        
         final_date = known_date
         
-        # If no date, try URL pattern
         if not final_date:
             final_date = find_date_in_url(link)
         
-        # Filter
         if final_date:
             final_date = make_naive(final_date)
             if final_date > cutoff:
                 results.append({'url': link, 'date': final_date})
                 
-    log_box.text(f"✅ Done. Found {len(results)} recent articles.")
+    progress_bar.progress(100)
+    status_text.text(f"✅ Done. Found {len(results)} recent articles.")
     return results
 
 # --- UI ---
@@ -187,7 +188,7 @@ def run_fast_analysis(url):
 st.set_page_config(page_title="Ultra Fast Scanner", layout="wide")
 
 st.title("⚡ Ultra Fast Article Scanner")
-st.write("**Speed Mode:** No slow content downloads. Uses RSS, Sitemaps, and URL patterns only.")
+st.write("**Speed Mode:** Includes Progress Bar. Uses RSS, Sitemaps, and URL patterns only.")
 
 url_input = st.text_input("Website URL", placeholder="https://rayon.in.ua/")
 
