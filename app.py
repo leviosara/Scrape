@@ -9,7 +9,9 @@ from datetime import datetime, timedelta
 import feedparser
 
 # --- CONFIGURATION ---
-TIME_THRESHOLD = datetime.now() - timedelta(days=2)
+# Strict Cutoff: Yesterday at Midnight (Ensures exactly 2 calendar days)
+TODAY = datetime.now().date()
+YESTERDAY_START = datetime.combine(TODAY - timedelta(days=1), datetime.min.time())
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
 # --- HELPER FUNCTIONS ---
@@ -27,6 +29,7 @@ def make_naive(dt):
     return dt
 
 def find_date_in_url(url):
+    # Matches YYYY/MM/DD or YYYY-MM-DD
     patterns = [r'/(\d{4})/(\d{1,2})/(\d{1,2})/', r'/(\d{4})-(\d{1,2})-(\d{1,2})']
     for pat in patterns:
         match = re.search(pat, url)
@@ -36,14 +39,30 @@ def find_date_in_url(url):
             except: pass
     return None
 
-def is_news_url(url):
+def is_real_article(url):
+    """
+    Strict filter to remove Category/Tag pages and keep only actual articles.
+    """
     url_lower = url.lower()
-    if any(x in url_lower for x in ['/tag/', '/author/', '/page/', '/category/', '/feed/', '.jpg', '.css']):
+    
+    # 1. Blacklist obvious junk
+    blacklist = ['/tag/', '/author/', '/page/', '/category/', '/feed/', 
+                 '.jpg', '.png', '.gif', '.pdf', '.css', '.js', 
+                 'replytocom', '/edit', '/amp/']
+    if any(x in url_lower for x in blacklist):
         return False
+        
+    # 2. Depth Check (Crucial)
+    # Real articles usually have longer URLs: site.com/category/article-title (4 slashes)
+    # Category pages look like: site.com/category/ (3 slashes)
+    # https:// = 2 slashes.
+    # So we require AT LEAST 4 slashes total to be considered an article.
+    if url_lower.count('/') < 4:
+        return False
+        
     return True
 
 def guess_category_from_url(sitemap_url):
-    """Extracts the category name from the sitemap filename (e.g., sport-sitemap.xml -> Sport)"""
     filename = sitemap_url.split('/')[-1].lower()
     if 'news' in filename: return 'News'
     if 'sport' in filename: return 'Sport'
@@ -71,7 +90,8 @@ def check_rss(base_url, status):
                         if link and published:
                             dt = datetime(*published[:6])
                             dt = make_naive(dt)
-                            if dt > TIME_THRESHOLD:
+                            # Strict check: Must be after Yesterday Midnight
+                            if dt > YESTERDAY_START and is_real_article(link):
                                 found[link] = {'date': dt, 'category': 'RSS Feed'}
                     if found:
                         return found
@@ -79,7 +99,6 @@ def check_rss(base_url, status):
     return found
 
 def analyze_sitemap_index(index_url, status):
-    """Finds ALL relevant sitemap files from the index."""
     status.update(label="🔎 Analyzing Sitemap Index...")
     try:
         r = requests.get(index_url, timeout=5, headers={'User-Agent': USER_AGENT})
@@ -88,11 +107,9 @@ def analyze_sitemap_index(index_url, status):
 
     sitemaps_to_scan = []
     
-    # If it's just a single URL set, return it
     if 'urlset' in str(root.tag).lower():
         return [(index_url, 'Main')]
 
-    # It is an index, let's filter the children
     if 'sitemapindex' in str(root.tag).lower():
         for child in root:
             loc = None
@@ -103,18 +120,16 @@ def analyze_sitemap_index(index_url, status):
             
             if not loc: continue
 
-            # FILTERING LOGIC
-            # 1. Check Name (Prioritize News/Post/Category names)
+            # Filter: Keep if Priority Name OR Recently Updated
             is_priority = any(x in loc.lower() for x in ['news', 'post', 'sport', 'history', 'investig'])
-            
-            # 2. Check Date (Was this sitemap file updated recently?)
             is_recent = False
+            
             if lastmod:
                 mod_date = make_naive(dateparser.parse(lastmod))
-                if mod_date and mod_date > (datetime.now() - timedelta(days=14)): # Check if sitemap itself was updated in last 2 weeks
+                # Check if sitemap was updated in the last 3 days
+                if mod_date and mod_date > (datetime.now() - timedelta(days=3)): 
                     is_recent = True
             
-            # Decision: Keep if it has a good name OR if it was updated recently
             if is_priority or is_recent:
                 category = guess_category_from_url(loc)
                 sitemaps_to_scan.append((loc, category))
@@ -122,7 +137,6 @@ def analyze_sitemap_index(index_url, status):
     return sitemaps_to_scan
 
 def scan_sitemap_file(sm_url, category, status):
-    """Scans a specific sitemap file for articles."""
     results = {}
     try:
         r = requests.get(sm_url, timeout=5, headers={'User-Agent': USER_AGENT})
@@ -138,21 +152,21 @@ def scan_sitemap_file(sm_url, category, status):
                 if 'loc' in str(x.tag).lower(): url = x.text
                 if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
             
-            if url and is_news_url(url):
-                # Check Date
+            # STRICT FILTERING
+            if url and is_real_article(url):
                 valid = False
                 
                 # A. Sitemap Date
                 if dt:
                     dt = make_naive(dt)
-                    if dt > TIME_THRESHOLD: valid = True
+                    if dt > YESTERDAY_START: valid = True
                 
                 # B. URL Date (Fallback)
                 if not valid:
                     dt_url = find_date_in_url(url)
                     if dt_url:
                         dt_url = make_naive(dt_url)
-                        if dt_url > TIME_THRESHOLD:
+                        if dt_url > YESTERDAY_START:
                             dt = dt_url
                             valid = True
                 
@@ -164,13 +178,13 @@ def scan_sitemap_file(sm_url, category, status):
 
 # --- MAIN ORCHESTRATOR ---
 
-def run_deep_scan(url):
-    status = st.status("🚀 Starting Deep Scan...", expanded=True)
+def run_accurate_scan(url):
+    status = st.status("🚀 Starting Accurate Scan...", expanded=True)
     
     # 1. RSS
     rss_res = check_rss(url, status)
     
-    # 2. Sitemap Discovery
+    # 2. Sitemaps
     domain = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
     index_paths = [f"{domain}/sitemap.xml", f"{domain}/sitemap_index.xml"]
     
@@ -181,10 +195,10 @@ def run_deep_scan(url):
             all_sitemaps = found
             break
             
-    # 3. Deep Scan (No Limits)
+    # 3. Deep Scan
     sitemap_res = {}
     if all_sitemaps:
-        status.update(label=f"🔎 Deep Scanning {len(all_sitemaps)} Sitemap Sections...")
+        status.update(label=f"🔎 Scanning {len(all_sitemaps)} Sitemap Sections...")
         
         for i, (sm_url, cat) in enumerate(all_sitemaps):
             status.update(label=f"📄 Scanning [{cat}] ({i+1}/{len(all_sitemaps)})...")
@@ -197,57 +211,53 @@ def run_deep_scan(url):
     # Feedback
     if not final_articles:
         status.update(label="❌ Scan Complete: No articles found.", state="error")
-        return None, "Scanned deeply but found no articles matching the 2-day criteria."
+        return None, "No articles found for Today or Yesterday."
         
-    status.update(label=f"✅ Deep Scan Complete. Found {len(final_articles)} articles.", state="complete")
+    status.update(label=f"✅ Success! Found {len(final_articles)} articles.", state="complete")
     return final_articles, None
 
 # --- UI ---
 
-st.set_page_config(page_title="Deep 2-Day Scanner", layout="wide")
+st.set_page_config(page_title="Accurate 2-Day Scanner", layout="wide")
 
-st.title("🦈 Deep 2-Day Scanner")
-st.write("Scans **ALL** sitemap categories (News, Sport, History) without arbitrary limits.")
+st.title("🎯 Accurate 2-Day Scanner")
+st.write(f"Strictly counts articles from **Yesterday** and **Today**. Filters out category pages.")
 
 url_input = st.text_input("Website URL", placeholder="https://rayon.in.ua/")
 
-if st.button("Run Deep Scan"):
+if st.button("Scan Now"):
     if url_input:
         try:
-            articles, error = run_deep_scan(clean_url(url_input))
+            articles, error = run_accurate_scan(clean_url(url_input))
             
             if error:
                 st.warning(error)
             
             if articles:
-                # Format Data
                 df = pd.DataFrame.from_dict(articles, orient='index')
                 df.reset_index(inplace=True)
                 df.columns = ['url', 'date', 'category']
                 df['date'] = pd.to_datetime(df['date'])
                 
-                today = datetime.now().date()
-                yesterday = (datetime.now() - timedelta(days=1)).date()
                 df['day'] = df['date'].dt.date
                 
-                # Stats
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Today", len(df[df['day'] == today]))
-                c2.metric("Yesterday", len(df[df['day'] == yesterday]))
-                c3.metric("Total (48h)", len(df))
+                count_today = len(df[df['day'] == TODAY])
+                count_yesterday = len(df[df['day'] == (TODAY - timedelta(days=1))])
                 
-                # Category Breakdown (Proof of Deep Scan)
-                st.subheader("📂 Articles by Category")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Today", count_today)
+                c2.metric("Yesterday", count_yesterday)
+                c3.metric("Total", len(df))
+                
+                st.divider()
+                
+                st.subheader("📂 By Category")
                 cat_counts = df['category'].value_counts().reset_index()
                 cat_counts.columns = ['Category', 'Count']
                 st.dataframe(cat_counts, use_container_width=True)
                 
-                st.divider()
-                
                 with st.expander("View Full Article List"):
                     st.dataframe(df.sort_values('date', ascending=False), use_container_width=True)
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button("Download CSV", csv, "deep_scan.csv", "text/csv")
                     
         except Exception as e:
             st.error(f"Critical Error: {e}")
