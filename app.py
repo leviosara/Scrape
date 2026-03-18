@@ -169,7 +169,7 @@ def analyze_website(url):
     candidates = [(u, d) for u, d in combined.items()]
     
     # 2. Analyze Dates
-    progress = st.progress(0.5, text=f"Found {len(candidates)} links. Checking dates..."))
+    progress = st.progress(0.5, text=f"Found {len(candidates)} links. Checking dates...")
     articles = []
     checks_done = 0
     
