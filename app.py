@@ -1,18 +1,3 @@
-import streamlit as st
-import requests
-from urllib.parse import urlparse
-import trafilatura
-import dateparser
-import pandas as pd
-from datetime import datetime, date, timedelta
-import xml.etree.ElementTree as ET
-import feedparser
-
-# --- CONFIGURATION ---
-DAYS_TO_SCAN = 7
-
-# --- CORE FUNCTIONS ---
-
 def get_sitemap_urls(base_url):
     parsed = urlparse(base_url)
     domain = f"{parsed.scheme}://{parsed.netloc}"
@@ -40,11 +25,39 @@ def get_sitemap_urls(base_url):
         except: pass
 
     # 2. Parse Sitemap
-    for sm in sitemaps:
+    # Use a set to avoid processing the same sitemap twice
+    processed_sitemaps = set()
+
+    while sitemaps:
+        sm = sitemaps.pop(0)
+        if sm in processed_sitemaps:
+            continue
+        processed_sitemaps.add(sm)
+
         try:
             r = requests.get(sm, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
             root = ET.fromstring(r.content)
             
+            # Check if it is a Sitemap Index (contains links to other sitemaps)
             if 'sitemapindex' in str(root.tag).lower():
                 for child in root:
-                    loc = [c.text for c in child if 'loc' in c
+                    # CORRECTED LINE: Extract loc text properly
+                    locs = [c.text for c in child if 'loc' in str(c.tag).lower()]
+                    for loc in locs:
+                        if loc:
+                            sitemaps.append(loc)
+            
+            # Check if it is a URL Set (contains actual page links)
+            elif 'urlset' in str(root.tag).lower():
+                for child in root:
+                    # CORRECTED LINE: Extract loc text properly
+                    locs = [c.text for c in child if 'loc' in str(c.tag).lower()]
+                    for loc in locs:
+                        if loc:
+                            found_urls.append(loc)
+                            
+        except Exception as e:
+            # Ignore errors for individual sitemaps
+            continue
+
+    return found_urls
