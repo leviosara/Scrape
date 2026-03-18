@@ -11,9 +11,9 @@ import feedparser
 
 # --- CONFIGURATION ---
 DAYS_TO_SCAN = 7
-MAX_SLOW_CHECKS = 50  # Limit deep content scans
-MAX_SITEMAP_FILES = 5 # Stop after scanning 5 sitemap files (speed up)
-MAX_URLS = 1000       # Stop after finding 1000 links
+MAX_SLOW_CHECKS = 50
+# Increased limit now that we filter out junk
+MAX_SITEMAP_FILES = 20 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
 # --- HELPER FUNCTIONS ---
@@ -50,6 +50,20 @@ def get_date_from_html(html):
     if match: return dateparser.parse(match.group(1))
     return None
 
+# --- SMART SITEMAP FILTER ---
+
+def is_junk_sitemap(url):
+    """Identifies sitemaps that are NOT articles (Tags, Authors, etc.)"""
+    url_lower = url.lower()
+    junk_words = ['tag', 'author', 'attachment', 'page', 'category', 'archive']
+    return any(word in url_lower for word in junk_words)
+
+def is_priority_sitemap(url):
+    """Identifies sitemaps that are highly valuable (Posts, News)"""
+    url_lower = url.lower()
+    priority_words = ['post', 'news', 'article', 'story', 'history', 'sport', 'investigation']
+    return any(word in url_lower for word in priority_words)
+
 # --- SCANNING STRATEGIES ---
 
 def scan_rss_feeds(base_url, log_box):
@@ -77,36 +91,57 @@ def scan_rss_feeds(base_url, log_box):
     return found
 
 def scan_sitemaps(base_url, log_box):
-    log_box.text("⏳ Step 2: Scanning Sitemaps (Strict Limit: 5 files)...")
+    log_box.text("⏳ Step 2: Discovering ALL Sitemaps...")
     domain = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-    paths = ["/sitemap.xml", "/sitemap_index.xml", "/post-sitemap.xml"]
-    sitemaps = set()
-    found = {}
     
-    # Quick check for robots.txt
+    # 1. Discover all sitemap URLs
+    sitemap_urls = set()
+    # Check robots.txt
     try:
         r = requests.get(f"{domain}/robots.txt", timeout=3, headers={'User-Agent': USER_AGENT})
         for line in r.text.split('\n'):
-            if 'Sitemap:' in line: sitemaps.add(line.split('Sitemap:')[1].strip())
+            if 'Sitemap:' in line: sitemap_urls.add(line.split('Sitemap:')[1].strip())
     except: pass
     
-    # Quick check for common paths
-    for p in paths:
-        try:
-            r = requests.get(domain + p, timeout=3)
-            if r.status_code == 200: sitemaps.add(domain + p)
-        except: pass
+    # Check standard index
+    try:
+        r = requests.get(f"{domain}/sitemap.xml", timeout=3)
+        root = ET.fromstring(r.content)
+        # If it's an index, get all children
+        if 'sitemapindex' in str(root.tag).lower():
+            for c in root:
+                locs = [x.text for x in c if 'loc' in str(x.tag).lower()]
+                for l in locs: sitemap_urls.add(l)
+        else:
+            sitemap_urls.add(f"{domain}/sitemap.xml")
+    except: pass
 
-    processed = set()
-    sitemaps_scanned_count = 0
+    log_box.text(f"🔎 Found {len(sitemap_urls)} total sitemap files. Filtering...")
+
+    # 2. SMART FILTERING
+    # Separate into Priority and Others
+    priority_maps = []
+    other_maps = []
     
-    while sitemaps:
-        # HARD LIMIT: Stop after scanning X sitemaps
-        if sitemaps_scanned_count >= MAX_SITEMAP_FILES:
-            log_box.text(f"🛑 Sitemap limit reached ({MAX_SITEMAP_FILES} files). Moving on...")
-            break
-            
-        sm = sitemaps.pop()
+    for url in sitemap_urls:
+        if is_junk_sitemap(url):
+            continue # Skip tags/authors completely
+        if is_priority_sitemap(url):
+            priority_maps.append(url)
+        else:
+            other_maps.append(url)
+    
+    # Combine: Priority first, then others (up to limit)
+    final_sitemaps = priority_maps + other_maps
+    final_sitemaps = final_sitemaps[:MAX_SITEMAP_FILES]
+    
+    log_box.text(f"🎯 Selected {len(final_sitemaps)} relevant sitemaps to scan (Posts, News, etc.).")
+
+    # 3. Scan Selected Sitemaps
+    found = {}
+    processed = set()
+    
+    for sm in final_sitemaps:
         if sm in processed: continue
         processed.add(sm)
         
@@ -117,14 +152,15 @@ def scan_sitemaps(base_url, log_box):
             r = requests.get(sm, timeout=5, headers={'User-Agent': USER_AGENT})
             root = ET.fromstring(r.content)
             
+            # Handle nested indexes
             if 'sitemapindex' in str(root.tag).lower():
-                # If it's an index, add children to queue
                 for c in root:
                     locs = [x.text for x in c if 'loc' in str(x.tag).lower()]
-                    for l in locs: sitemaps.add(l)
+                    for l in locs:
+                        # Recursively add, but strictly limit depth
+                        if l not in processed: final_sitemaps.append(l) 
             
             elif 'urlset' in str(root.tag).lower():
-                sitemaps_scanned_count += 1
                 for c in root:
                     url = None; dt = None
                     for x in c:
@@ -133,9 +169,6 @@ def scan_sitemaps(base_url, log_box):
                     if url:
                         found[url] = dt
                         
-                    # HARD LIMIT: Stop if we have enough URLs
-                    if len(found) >= MAX_URLS:
-                        break
         except Exception as e:
             log_box.text(f"   ⚠️ Error on {sm}: {str(e)[:20]}")
             continue
@@ -185,13 +218,11 @@ def run_analysis(url):
     slow_checks_done = 0
     
     for i, (link, known_date) in enumerate(candidates_list):
-        # Update progress
         if i % 10 == 0:
             progress.progress(int((i / len(candidates_list)) * 100))
         
         final_date = known_date
         
-        # If we have a date, verify it's recent
         if final_date:
             final_date = make_naive(final_date)
             if final_date > cutoff:
@@ -199,10 +230,8 @@ def run_analysis(url):
             continue
 
         # If NO date, try to find it quickly
-        # A. Check URL
         final_date = find_date_in_url(link)
         
-        # B. Check Content (ONLY if we haven't done too many)
         if not final_date and slow_checks_done < MAX_SLOW_CHECKS:
             slow_checks_done += 1
             try:
@@ -221,14 +250,14 @@ def run_analysis(url):
 
 # --- UI ---
 
-st.set_page_config(page_title="Fast Scanner", layout="wide")
+st.set_page_config(page_title="Smart News Scanner", layout="wide")
 
-st.title("⚡ Fast Article Scanner")
-st.write(f"Scans RSS, Sitemaps (Max {MAX_SITEMAP_FILES} files), and Homepage.")
+st.title("📰 Smart News Scanner")
+st.write("Filters sitemaps to prioritize **News, Posts, and Categories** while ignoring Tags/Authors.")
 
 url_input = st.text_input("Website URL", placeholder="https://rayon.in.ua/")
 
-if st.button("Run Fast Scan"):
+if st.button("Run Smart Scan"):
     if url_input:
         try:
             results = run_analysis(clean_url(url_input))
