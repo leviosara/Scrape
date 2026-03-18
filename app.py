@@ -10,165 +10,196 @@ from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
 DAYS_TO_SCAN = 7
-MAX_CONTENT_CHECKS = 1000  # Increased significantly
-MAX_SITEMAP_URLS = 3000
+MAX_CONTENT_CHECKS = 1000  # Increased limit to check more pages for dates
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
 # --- HELPER FUNCTIONS ---
 
 def clean_url(url):
+    """Ensures URL has a scheme."""
     url = url.strip()
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
-    # Ensure trailing slash for path detection consistency
-    if not url.endswith('/'):
-        # Check if it's a path or just domain
-        parsed = urlparse(url)
-        if parsed.path: # It has a path like /en
-            url += '/'
     return url
 
 def make_naive(dt):
-    if dt is None: return None
+    """Removes timezone info to prevent comparison errors."""
+    if dt is None:
+        return None
+    # If timezone aware, remove timezone info (convert to naive)
     if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
         return dt.replace(tzinfo=None)
     return dt
 
 def find_date_in_url(url):
-    # Regex for dates like 2023/10/25 or 2023-10-25
-    patterns = [r'/(\d{4})/(\d{1,2})/(\d{1,2})/', r'/(\d{4})-(\d{1,2})-(\d{1,2})']
+    """Attempts to find a date like 2023/10/25 in the URL string."""
+    patterns = [
+        r'/(\d{4})/(\d{1,2})/(\d{1,2})/', 
+        r'/(\d{4})-(\d{1,2})-(\d{1,2})'
+    ]
     for pat in patterns:
         match = re.search(pat, url)
         if match:
             date_str = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
-            try: return dateparser.parse(date_str)
-            except: pass
+            try:
+                return dateparser.parse(date_str)
+            except:
+                pass
     return None
 
-def is_likely_article(url):
-    url_lower = url.lower()
-    skip = ['/tag/', '/category/', '/author/', '/page/', '/feed/', '.jpg', '.png', '.gif', '.pdf', '#respond', 'amp']
-    return not any(s in url_lower for s in skip)
-
 def extract_date_from_html(html):
-    if not html: return None
+    """Aggressively search for a date in HTML metadata."""
+    if not html:
+        return None
+    
     # 1. Trafilatura metadata (Best for content)
     try:
         metadata = trafilatura.extract_metadata(html)
         if metadata and metadata.date:
             return dateparser.parse(metadata.date)
-    except: pass
+    except:
+        pass
 
     # 2. JSON-LD (Schema.org)
     match = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html)
     if match:
-        try: return dateparser.parse(match.group(1))
-        except: pass
+        try:
+            return dateparser.parse(match.group(1))
+        except:
+            pass
         
-    # 3. Open Graph
+    # 3. Open Graph / Meta tags
     match = re.search(r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']', html)
     if match:
-        try: return dateparser.parse(match.group(1))
-        except: pass
+        try:
+            return dateparser.parse(match.group(1))
+        except:
+            pass
         
     return None
 
-# --- MAIN SCRAPER ---
+# --- SCANNING STRATEGIES ---
 
-def get_articles(base_url):
-    parsed_input = urlparse(base_url)
-    domain_root = f"{parsed_input.scheme}://{parsed_input.netloc}"
+def scan_sitemaps(base_url, status_placeholder):
+    """Strategy 1: Scan sitemaps."""
+    status_placeholder.text("Strategy 1: Scanning Sitemaps...")
+    domain = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
     
-    # We construct sitemap paths based on WHERE the user pointed
-    # If user said site.com/en/, we check site.com/en/sitemap.xml AND site.com/sitemap.xml
-    specific_sitemap_paths = [
+    # Potential sitemap locations
+    paths = [
         f"{base_url}sitemap.xml", 
         f"{base_url}sitemap_index.xml",
-        f"{base_url}post-sitemap.xml"
-    ]
-    root_sitemap_paths = [
-        f"{domain_root}/sitemap.xml",
-        f"{domain_root}/sitemap_index.xml"
+        f"{base_url}post-sitemap.xml", 
+        f"{base_url}news-sitemap.xml",
+        f"{domain}/sitemap.xml", 
+        f"{domain}/sitemap_index.xml"
     ]
     
-    # Combine and deduplicate paths to check
-    all_paths = list(set(specific_sitemap_paths + root_sitemap_paths))
-    sitemaps = []
+    sitemaps = set()
+    found_urls = {} # Dict: url -> date
     
-    # 1. Find Initial Sitemaps
-    for path in all_paths:
-        try:
-            r = requests.get(path, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-            if r.status_code == 200:
-                sitemaps.append(path)
-        except: continue
-
-    # Fallback: Robots.txt
+    # Check robots.txt
     try:
-        r = requests.get(f"{domain_root}/robots.txt", timeout=5)
-        for line in r.text.split('\n'):
-            if 'Sitemap:' in line:
-                sitemaps.append(line.split('Sitemap:')[1].strip())
-    except: pass
+        r = requests.get(f"{domain}/robots.txt", timeout=5, headers={'User-Agent': USER_AGENT})
+        if r.status_code == 200:
+            for line in r.text.split('\n'):
+                if 'Sitemap:' in line:
+                    sitemaps.add(line.split('Sitemap:')[1].strip())
+    except:
+        pass
 
-    if not sitemaps:
-        st.error("No sitemaps found at root or provided path.")
-        return []
+    # Check common paths
+    for p in paths:
+        try:
+            r = requests.get(p, timeout=5, headers={'User-Agent': USER_AGENT})
+            if r.status_code == 200:
+                sitemaps.add(p)
+        except:
+            pass
 
-    # 2. Crawl Sitemaps
-    progress = st.progress(0, text="Step 1: Gathering links from sitemaps...")
-    processed_sitemaps = set()
-    raw_urls = [] # List of (url, date_str)
-    
+    processed = set()
     while sitemaps:
-        sm = sitemaps.pop(0)
-        if sm in processed_sitemaps: continue
-        processed_sitemaps.add(sm)
+        sm = sitemaps.pop()
+        if sm in processed:
+            continue
+        processed.add(sm)
         
         try:
-            r = requests.get(sm, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+            r = requests.get(sm, timeout=5, headers={'User-Agent': USER_AGENT})
             root = ET.fromstring(r.content)
             
             if 'sitemapindex' in str(root.tag).lower():
                 for child in root:
                     locs = [c.text for c in child if 'loc' in str(c.tag).lower()]
-                    for loc in locs: 
-                        if loc: sitemaps.append(loc)
+                    for loc in locs:
+                        if loc:
+                            sitemaps.add(loc)
             
             elif 'urlset' in str(root.tag).lower():
                 for child in root:
                     url = None
                     date_str = None
                     for c in child:
-                        if 'loc' in str(c.tag).lower(): url = c.text
-                        if 'lastmod' in str(c.tag).lower(): date_str = c.text
-                        if 'publication_date' in str(c.tag).lower(): date_str = c.text
-                    
-                    if url and is_likely_article(url):
-                        raw_urls.append((url, date_str))
-                        
-            # Limit check
-            if len(raw_urls) > MAX_SITEMAP_URLS: break
+                        if 'loc' in str(c.tag).lower():
+                            url = c.text
+                        if 'lastmod' in str(c.tag).lower() or 'publication' in str(c.tag).lower():
+                            date_str = c.text
+                    if url:
+                        found_urls[url] = date_str
+        except:
+            continue
 
-        except: continue
+    return found_urls
 
-    progress.progress(100, text=f"Found {len(raw_urls)} total links.")
+def scan_homepage(base_url, status_placeholder):
+    """Strategy 2: Scan Homepage for links."""
+    status_placeholder.text("Strategy 2: Scanning Homepage Links...")
+    found_urls = {}
+    try:
+        r = requests.get(base_url, timeout=10, headers={'User-Agent': USER_AGENT})
+        links = re.findall(r'href=["\']([^"\']+)["\']', r.text)
+        
+        domain_netloc = urlparse(base_url).netloc
+        for link in links:
+            full_link = urljoin(base_url, link)
+            # Filter: keep only internal links, skip obvious junk
+            if urlparse(full_link).netloc == domain_netloc:
+                if not any(x in full_link.lower() for x in ['.jpg', '.png', '.css', '.js', '/tag/', '/category/', '/page/']):
+                    found_urls[full_link] = None # No date from homepage
+    except:
+        pass
+    return found_urls
 
-    # 3. Analyze Dates
-    cutoff_date = datetime.now() - timedelta(days=DAYS_TO_SCAN)
-    articles = []
-    checked_content = 0
+# --- MAIN ORCHESTRATOR ---
+
+def run_analysis(url):
+    cutoff = datetime.now() - timedelta(days=DAYS_TO_SCAN)
     
-    # Sort: Put URLs with dates at the top to process fast ones first
-    raw_urls.sort(key=lambda x: x[1] is None)
+    # 1. Gather Candidates
+    status = st.empty()
+    sitemap_candidates = scan_sitemaps(url, status)
+    homepage_candidates = scan_homepage(url, status)
     
-    status_text = st.empty()
+    # Combine: Start with sitemap data, add homepage data if not present
+    all_candidates = sitemap_candidates.copy()
+    for u, d in homepage_candidates.items():
+        if u not in all_candidates:
+            all_candidates[u] = d
+            
+    candidates_list = list(all_candidates.items()) # [(url, date), ...]
     
-    for i, (url, sitemap_date) in enumerate(raw_urls):
-        # Update UI
+    st.info(f"Found {len(candidates_list)} total unique links. Checking dates...")
+    
+    # 2. Filter by Date
+    results = []
+    progress = st.progress(0)
+    content_checks = 0
+    
+    for i, (link, sitemap_date) in enumerate(candidates_list):
+        # Update UI progress
         if i % 20 == 0:
-            pct = int((i / len(raw_urls)) * 100)
-            status_text.text(f"Analyzing {i}/{len(raw_urls)}... | Found so far: {len(articles)}")
-
+            progress.progress(int((i / len(candidates_list)) * 100), text=f"Processing {i}/{len(candidates_list)}...")
+        
         final_date = None
         
         # Method 1: Sitemap Date (Fastest)
@@ -177,39 +208,43 @@ def get_articles(base_url):
         
         # Method 2: URL Date (Fast)
         if not final_date:
-            final_date = find_date_in_url(url)
+            final_date = find_date_in_url(link)
             
-        # Method 3: Content Check (Slow - only if we haven't hit limit)
-        if not final_date and checked_content < MAX_CONTENT_CHECKS:
-            checked_content += 1
+        # Method 3: Content Check (Slow - only if needed and within limit)
+        if not final_date and content_checks < MAX_CONTENT_CHECKS:
+            content_checks += 1
             try:
-                html = trafilatura.fetch_url(url)
+                html = trafilatura.fetch_url(link)
                 final_date = extract_date_from_html(html)
-            except: pass
+            except:
+                pass
         
-        # Filter & Save
+        # Final Check: Is it within our range?
         if final_date:
-            final_date = make_naive(final_date)
-            if final_date > cutoff_date:
-                articles.append({'url': url, 'date': final_date})
+            final_date = make_naive(final_date) # Fix timezone errors
+            if final_date > cutoff:
+                results.append({
+                    'url': link,
+                    'date': final_date
+                })
 
-    status_text.text("Analysis Complete.")
-    return articles
+    progress.empty()
+    status.empty()
+    return results
 
 # --- STREAMLIT UI ---
 
-st.set_page_config(page_title="Deep Scanner", layout="wide")
+st.set_page_config(page_title="Complete Article Finder", layout="wide")
 
-st.title("🔎 Deep Article Scanner")
-st.write(f"Scans sitemaps deeply to find articles from the last **{DAYS_TO_SCAN} days**.")
-st.info("Tip: Enter the specific section URL (e.g., `site.com/en/`) for better accuracy.")
+st.title("📡 Complete Article Finder")
+st.write(f"Scans both **Sitemap** and **Homepage** to find all articles from the last **{DAYS_TO_SCAN} days**.")
 
 url_input = st.text_input("Website URL", placeholder="https://most.ks.ua/en/")
 
-if st.button("Scan Now"):
+if st.button("Deep Scan"):
     if url_input:
         try:
-            results = get_articles(clean_url(url_input))
+            results = run_analysis(clean_url(url_input))
             
             if results:
                 df = pd.DataFrame(results)
@@ -234,7 +269,7 @@ if st.button("Scan Now"):
                     csv = df.to_csv(index=False).encode('utf-8')
                     st.download_button("Download CSV", csv, "articles.csv", "text/csv")
             else:
-                st.error("No articles found in the date range. Try the main domain URL if the sub-link fails.")
+                st.error("No articles found. The site might use a format we can't read, or has no recent content.")
         except Exception as e:
             st.error(f"Critical Error: {e}")
     else:
