@@ -9,10 +9,12 @@ from datetime import datetime, timedelta
 import feedparser
 
 # --- CONFIGURATION ---
-# Strict Cutoff: Yesterday at Midnight (Ensures exactly 2 calendar days)
+# Cutoff: Yesterday at Midnight (Strict Today + Yesterday)
 TODAY = datetime.now().date()
 YESTERDAY_START = datetime.combine(TODAY - timedelta(days=1), datetime.min.time())
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+# Increased limit for high volume sites like rayon.in.ua
+MAX_SITEMAPS = 50 
 
 # --- HELPER FUNCTIONS ---
 
@@ -29,7 +31,6 @@ def make_naive(dt):
     return dt
 
 def find_date_in_url(url):
-    # Matches YYYY/MM/DD or YYYY-MM-DD
     patterns = [r'/(\d{4})/(\d{1,2})/(\d{1,2})/', r'/(\d{4})-(\d{1,2})-(\d{1,2})']
     for pat in patterns:
         match = re.search(pat, url)
@@ -41,23 +42,25 @@ def find_date_in_url(url):
 
 def is_real_article(url):
     """
-    Strict filter to remove Category/Tag pages and keep only actual articles.
+    CALIBRATED FILTER:
+    1. Block Homepage.
+    2. Block Blacklisted words (Tags, Categories).
+    3. DO NOT block based on URL depth (fixes lb.ua / devby.io issues).
     """
     url_lower = url.lower()
+    parsed = urlparse(url)
     
-    # 1. Blacklist obvious junk
-    blacklist = ['/tag/', '/author/', '/page/', '/category/', '/feed/', 
-                 '.jpg', '.png', '.gif', '.pdf', '.css', '.js', 
-                 'replytocom', '/edit', '/amp/']
-    if any(x in url_lower for x in blacklist):
+    # 1. Block Homepage
+    if parsed.path in ['', '/', '/index.php', '/index.html']:
         return False
-        
-    # 2. Depth Check (Crucial)
-    # Real articles usually have longer URLs: site.com/category/article-title (4 slashes)
-    # Category pages look like: site.com/category/ (3 slashes)
-    # https:// = 2 slashes.
-    # So we require AT LEAST 4 slashes total to be considered an article.
-    if url_lower.count('/') < 4:
+
+    # 2. Strict Blacklist
+    blacklist = [
+        '/tag/', '/tags/', '/author/', '/page/', '/category/', '/categories/', 
+        '/feed/', 'replytocom', '/edit', '/amp/', '/search/', '/filter/',
+        '.jpg', '.png', '.gif', '.pdf', '.css', '.js'
+    ]
+    if any(x in url_lower for x in blacklist):
         return False
         
     return True
@@ -66,9 +69,8 @@ def guess_category_from_url(sitemap_url):
     filename = sitemap_url.split('/')[-1].lower()
     if 'news' in filename: return 'News'
     if 'sport' in filename: return 'Sport'
-    if 'investig' in filename: return 'Investigation'
-    if 'history' in filename: return 'History'
     if 'post' in filename: return 'Posts'
+    if 'article' in filename: return 'Articles'
     return 'Main'
 
 # --- SCANNING STRATEGIES ---
@@ -76,7 +78,11 @@ def guess_category_from_url(sitemap_url):
 def check_rss(base_url, status):
     status.update(label="📡 Step 1: Checking RSS Feeds...")
     found = {}
-    paths = [f"{base_url}/feed/", f"{base_url}/rss/", f"{base_url}/en/feed/", f"{base_url}/uk/feed/"]
+    paths = [
+        f"{base_url}/feed/", f"{base_url}/rss/", 
+        f"{base_url}/en/feed/", f"{base_url}/uk/feed/",
+        f"{base_url}/news/feed/"
+    ]
     
     for path in paths:
         try:
@@ -90,10 +96,10 @@ def check_rss(base_url, status):
                         if link and published:
                             dt = datetime(*published[:6])
                             dt = make_naive(dt)
-                            # Strict check: Must be after Yesterday Midnight
                             if dt > YESTERDAY_START and is_real_article(link):
                                 found[link] = {'date': dt, 'category': 'RSS Feed'}
                     if found:
+                        status.update(label=f"✅ RSS: Found {len(found)} articles.")
                         return found
         except: continue
     return found
@@ -120,17 +126,18 @@ def analyze_sitemap_index(index_url, status):
             
             if not loc: continue
 
-            # Filter: Keep if Priority Name OR Recently Updated
-            is_priority = any(x in loc.lower() for x in ['news', 'post', 'sport', 'history', 'investig'])
+            # Logic: Keep if Priority Name OR Recently Updated
+            is_priority = any(x in loc.lower() for x in ['news', 'post', 'sport', 'history', 'investig', 'article'])
             is_recent = False
             
             if lastmod:
                 mod_date = make_naive(dateparser.parse(lastmod))
-                # Check if sitemap was updated in the last 3 days
-                if mod_date and mod_date > (datetime.now() - timedelta(days=3)): 
+                # Expanded to 14 days window for sitemap updates to be safe
+                if mod_date and mod_date > (datetime.now() - timedelta(days=14)): 
                     is_recent = True
             
-            if is_priority or is_recent:
+            # If we can't tell, include it anyway (Safety First)
+            if is_priority or is_recent or (not lastmod):
                 category = guess_category_from_url(loc)
                 sitemaps_to_scan.append((loc, category))
 
@@ -152,7 +159,7 @@ def scan_sitemap_file(sm_url, category, status):
                 if 'loc' in str(x.tag).lower(): url = x.text
                 if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
             
-            # STRICT FILTERING
+            # Apply Calibrated Filter
             if url and is_real_article(url):
                 valid = False
                 
@@ -178,8 +185,8 @@ def scan_sitemap_file(sm_url, category, status):
 
 # --- MAIN ORCHESTRATOR ---
 
-def run_accurate_scan(url):
-    status = st.status("🚀 Starting Accurate Scan...", expanded=True)
+def run_calibrated_scan(url):
+    status = st.status("🚀 Starting Calibrated Scan...", expanded=True)
     
     # 1. RSS
     rss_res = check_rss(url, status)
@@ -198,6 +205,8 @@ def run_accurate_scan(url):
     # 3. Deep Scan
     sitemap_res = {}
     if all_sitemaps:
+        # Limit to 50 sitemaps for high volume sites
+        all_sitemaps = all_sitemaps[:MAX_SITEMAPS]
         status.update(label=f"🔎 Scanning {len(all_sitemaps)} Sitemap Sections...")
         
         for i, (sm_url, cat) in enumerate(all_sitemaps):
@@ -205,30 +214,30 @@ def run_accurate_scan(url):
             part_res = scan_sitemap_file(sm_url, cat, status)
             sitemap_res.update(part_res)
             
-    # Combine
+    # Combine: RSS overwrites Sitemap if duplicates
     final_articles = {**sitemap_res, **rss_res}
     
     # Feedback
     if not final_articles:
         status.update(label="❌ Scan Complete: No articles found.", state="error")
-        return None, "No articles found for Today or Yesterday."
+        return None, "Scan complete but found no articles matching criteria."
         
     status.update(label=f"✅ Success! Found {len(final_articles)} articles.", state="complete")
     return final_articles, None
 
 # --- UI ---
 
-st.set_page_config(page_title="Accurate 2-Day Scanner", layout="wide")
+st.set_page_config(page_title="Calibrated News Scanner", layout="wide")
 
-st.title("🎯 Accurate 2-Day Scanner")
-st.write(f"Strictly counts articles from **Yesterday** and **Today**. Filters out category pages.")
+st.title("🎯 Calibrated News Scanner")
+st.write(f"Optimized for reference sites (lb.ua, rayon.in.ua, etc). Strict Today/Yesterday count.")
 
-url_input = st.text_input("Website URL", placeholder="https://rayon.in.ua/")
+url_input = st.text_input("Website URL", placeholder="https://lb.ua/")
 
-if st.button("Scan Now"):
+if st.button("Run Calibrated Scan"):
     if url_input:
         try:
-            articles, error = run_accurate_scan(clean_url(url_input))
+            articles, error = run_calibrated_scan(clean_url(url_input))
             
             if error:
                 st.warning(error)
@@ -258,6 +267,8 @@ if st.button("Scan Now"):
                 
                 with st.expander("View Full Article List"):
                     st.dataframe(df.sort_values('date', ascending=False), use_container_width=True)
+                    csv = df.to_csv(index=False).encode('utf-8')
+                    st.download_button("Download CSV", csv, "calibrated_scan.csv", "text/csv")
                     
         except Exception as e:
             st.error(f"Critical Error: {e}")
