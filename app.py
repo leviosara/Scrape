@@ -1,6 +1,6 @@
 import streamlit as st
 import requests
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 import pandas as pd
 import dateparser
@@ -9,7 +9,8 @@ from datetime import datetime, timedelta
 import feedparser
 
 # --- CONFIGURATION ---
-DAYS_TO_SCAN = 7
+# We only scan the last 2 days (48 hours)
+TIME_THRESHOLD = datetime.now() - timedelta(days=2)
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
 # --- HELPER FUNCTIONS ---
@@ -27,6 +28,7 @@ def make_naive(dt):
     return dt
 
 def find_date_in_url(url):
+    """Find date in URL like /2024/03/19/"""
     patterns = [r'/(\d{4})/(\d{1,2})/(\d{1,2})/', r'/(\d{4})-(\d{1,2})-(\d{1,2})']
     for pat in patterns:
         match = re.search(pat, url)
@@ -36,13 +38,24 @@ def find_date_in_url(url):
             except: pass
     return None
 
+def is_news_url(url):
+    """Filter: Keep only news-like URLs, skip tags/authors"""
+    url_lower = url.lower()
+    # Blacklist common junk paths
+    if any(x in url_lower for x in ['/tag/', '/author/', '/page/', '/category/', '/feed/', '.jpg', '.css']):
+        return False
+    return True
+
 # --- SCANNING STRATEGIES ---
 
-def scan_rss_feeds(base_url, status_text, progress_bar):
-    status_text.text("⏳ Step 1/3: Checking RSS Feeds...")
-    progress_bar.progress(10)
+def check_rss(base_url, status):
+    status.update(label="📡 Strategy 1: Checking RSS Feed (Best for News)...")
     found = {}
-    paths = [f"{base_url}/feed/", f"{base_url}/rss/", f"{base_url}/en/feed/", f"{base_url}/uk/feed/"]
+    paths = [
+        f"{base_url}/feed/", f"{base_url}/rss/", f"{base_url}/feed/atom/",
+        f"{base_url}/uk/feed/", f"{base_url}/en/feed/", # Language specific
+        f"{base_url}/news/feed/"
+    ]
     
     for path in paths:
         try:
@@ -50,177 +63,158 @@ def scan_rss_feeds(base_url, status_text, progress_bar):
             if r.status_code == 200:
                 feed = feedparser.parse(r.content)
                 if feed.entries:
+                    status.update(label=f"✅ RSS Found at {path}! Parsing entries...")
                     for entry in feed.entries:
                         link = entry.get('link')
+                        # Get date from RSS (most reliable)
                         published = entry.get('published_parsed') or entry.get('updated_parsed')
                         if link and published:
                             dt = datetime(*published[:6])
-                            found[link] = dt
+                            dt = make_naive(dt)
+                            if dt > TIME_THRESHOLD:
+                                found[link] = dt
                     if found:
-                        status_text.text(f"✅ RSS: Found {len(found)} articles.")
                         return found
         except: continue
     return found
 
-def scan_sitemaps_fast(base_url, status_text, progress_bar):
-    status_text.text("⏳ Step 2/3: Scanning Sitemaps...")
-    progress_bar.progress(30)
+def check_news_sitemaps(base_url, status):
+    status.update(label="📡 Strategy 2: Checking News Sitemaps...")
     domain = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
     
-    priority_paths = ["/post-sitemap.xml", "/news-sitemap.xml", "/sitemap.xml", "/sitemap_index.xml"]
+    # Prioritize news specific sitemaps
+    maps_to_try = [
+        f"{domain}/sitemap-news.xml", f"{domain}/news-sitemap.xml", 
+        f"{domain}/post-sitemap.xml", f"{domain}/sitemap.xml"
+    ]
+    
     found = {}
     
-    for i, path in enumerate(priority_paths):
-        # Update UI to show we are trying different files
-        status_text.text(f"⏳ Step 2/3: Trying sitemap {i+1}/{len(priority_paths)}...")
-        
+    for map_url in maps_to_try:
         try:
-            r = requests.get(domain + path, timeout=3, headers={'User-Agent': USER_AGENT})
+            r = requests.get(map_url, timeout=3, headers={'User-Agent': USER_AGENT})
             if r.status_code != 200: continue
             
             root = ET.fromstring(r.content)
             
+            # If it's an index, we only check the first child (usually newest)
             if 'sitemapindex' in str(root.tag).lower():
-                # If it's an index, we check the first 3 children
-                child_count = 0
+                # Grab first loc
                 for child in root:
-                    if child_count >= 3: break
-                    loc = [c.text for c in child if 'loc' in str(c.tag).lower()]
-                    if loc:
-                        try:
-                            r2 = requests.get(loc[0], timeout=3, headers={'User-Agent': USER_AGENT})
-                            if r2.status_code == 200:
+                    for x in child:
+                        if 'loc' in str(x.tag).lower():
+                            # Fetch child sitemap
+                            try:
+                                r2 = requests.get(x.text, timeout=3, headers={'User-Agent': USER_AGENT})
                                 root2 = ET.fromstring(r2.content)
-                                if 'urlset' in str(root2.tag).lower():
-                                    for c2 in root2:
-                                        url = None; dt = None
-                                        for x in c2:
-                                            if 'loc' in str(x.tag).lower(): url = x.text
-                                            if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
-                                        if url: found[url] = dt
-                        except: pass
-                    child_count += 1
+                                # Parse child
+                                entries = parse_sitemap_xml(root2)
+                                found.update(entries)
+                                break # Only check first child for speed
+                            except: pass
+                    break
             
             elif 'urlset' in str(root.tag).lower():
-                for child in root:
-                    url = None; dt = None
-                    for x in child:
-                        if 'loc' in str(x.tag).lower(): url = x.text
-                        if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
-                    if url: found[url] = dt
-            
-            # If we found stuff, stop early
-            if found: break
+                entries = parse_sitemap_xml(root)
+                found.update(entries)
                 
+            if found: break # Stop if we found stuff
+            
         except: continue
         
-    status_text.text(f"✅ Sitemap: Found {len(found)} potential URLs.")
-    progress_bar.progress(60)
     return found
 
-def scan_homepage(base_url, status_text, progress_bar):
-    status_text.text("⏳ Step 3/3: Scanning Homepage...")
-    progress_bar.progress(80)
-    found = {}
-    try:
-        r = requests.get(base_url, timeout=5, headers={'User-Agent': USER_AGENT})
-        links = re.findall(r'href=["\']([^"\']+)["\']', r.text)
-        domain_netloc = urlparse(base_url).netloc
-        for link in links:
-            full = urljoin(base_url, link)
-            if urlparse(full).netloc == domain_netloc:
-                if not any(x in full.lower() for x in ['.jpg', '.png', '/tag/', '/category/']):
-                    if find_date_in_url(full):
-                         found[full] = None
-                         
-        status_text.text(f"✅ Homepage: Found {len(found)} links with dates in URL.")
-    except: pass
-    return found
+def parse_sitemap_xml(root):
+    """Helper to parse URLSet XML"""
+    results = {}
+    for child in root:
+        url = None
+        dt = None
+        for x in child:
+            if 'loc' in str(x.tag).lower(): url = x.text
+            if 'lastmod' in str(x.tag).lower() or 'publication_date' in str(x.tag).lower():
+                dt = make_naive(dateparser.parse(x.text))
+        
+        if url and is_news_url(url):
+            # Check date
+            if dt and dt > TIME_THRESHOLD:
+                results[url] = dt
+            elif not dt:
+                # If no date in XML, check URL
+                dt_url = find_date_in_url(url)
+                if dt_url and make_naive(dt_url) > TIME_THRESHOLD:
+                    results[url] = make_naive(dt_url)
+                    
+    return results
 
 # --- MAIN ORCHESTRATOR ---
 
-def run_fast_analysis(url):
-    cutoff = datetime.now() - timedelta(days=DAYS_TO_SCAN)
+def run_sprint_scan(url):
+    status = st.status("🚀 Starting 2-Day Sprint Scan...", expanded=True)
     
-    # Create UI elements
-    status_text = st.empty()
-    progress_bar = st.progress(0)
+    # Step 1: RSS
+    rss_results = check_rss(url, status)
     
-    # 1. Gather Candidates
-    rss_articles = scan_rss_feeds(url, status_text, progress_bar)
-    sitemap_articles = scan_sitemaps_fast(url, status_text, progress_bar)
-    homepage_articles = scan_homepage(url, status_text, progress_bar)
-    
-    # Merge
-    all_candidates = homepage_articles.copy()
-    all_candidates.update(sitemap_articles)
-    all_candidates.update(rss_articles)
-    
-    candidates_list = list(all_candidates.items())
-    
-    # 2. Verify Dates
-    status_text.text(f"🔎 Filtering {len(candidates_list)} links...")
-    progress_bar.progress(90)
-    
-    results = []
-    
-    for i, (link, known_date) in enumerate(candidates_list):
-        # Mini progress update inside loop if huge list
-        if len(candidates_list) > 100 and i % 20 == 0:
-            pass # Avoid flickering too much, 90% is enough indicator
+    # Step 2: Sitemaps (if RSS failed or was empty)
+    sitemap_results = {}
+    if not rss_results:
+        sitemap_results = check_news_sitemaps(url, status)
         
-        final_date = known_date
-        
-        if not final_date:
-            final_date = find_date_in_url(link)
-        
-        if final_date:
-            final_date = make_naive(final_date)
-            if final_date > cutoff:
-                results.append({'url': link, 'date': final_date})
-                
-    progress_bar.progress(100)
-    status_text.text(f"✅ Done. Found {len(results)} recent articles.")
-    return results
+    # Combine
+    all_articles = {**sitemap_results, **rss_results} # RSS overwrites sitemap if duplicates
+    
+    # Final Checks
+    if not all_articles:
+        status.update(label="❌ Scan Complete: No articles found.", state="error")
+        return None, "Found links, but none matched the last 2 days. The site might be inactive or dates are hidden."
+    
+    # Format for display
+    status.update(label=f"✅ Scan Complete! Found {len(all_articles)} recent articles.", state="complete")
+    return all_articles, None
 
 # --- UI ---
 
-st.set_page_config(page_title="Ultra Fast Scanner", layout="wide")
+st.set_page_config(page_title="2-Day News Counter", layout="wide")
 
-st.title("⚡ Ultra Fast Article Scanner")
-st.write("**Speed Mode:** Includes Progress Bar. Uses RSS, Sitemaps, and URL patterns only.")
+st.title("⚡ 2-Day News Counter")
+st.write("Counts articles posted **Today** and **Yesterday** only. Fast feedback.")
 
-url_input = st.text_input("Website URL", placeholder="https://rayon.in.ua/")
+url_input = st.text_input("Website URL", placeholder="https://most.ks.ua/en/")
 
-if st.button("Run Fast Scan"):
+if st.button("Count Recent News"):
     if url_input:
         try:
-            results = run_fast_analysis(clean_url(url_input))
+            articles, error_msg = run_sprint_scan(clean_url(url_input))
             
-            if results:
-                df = pd.DataFrame(results)
+            if error_msg:
+                st.warning(error_msg)
+            
+            if articles:
+                df = pd.DataFrame(list(articles.items()), columns=['url', 'date'])
+                df['date'] = pd.to_datetime(df['date'])
+                
+                # Separate Today and Yesterday
+                today = datetime.now().date()
+                yesterday = (datetime.now() - timedelta(days=1)).date()
+                
                 df['day'] = df['date'].dt.date
                 
+                count_today = len(df[df['day'] == today])
+                count_yesterday = len(df[df['day'] == yesterday])
                 total = len(df)
-                avg = total / DAYS_TO_SCAN
                 
-                st.success(f"Success! Found {total} articles.")
+                # Display Metrics
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Today", count_today)
+                c2.metric("Yesterday", count_yesterday)
+                c3.metric("Total (48h)", total)
                 
-                c1, c2 = st.columns(2)
-                c1.metric("Total Articles", total)
-                c2.metric("Daily Average", f"{avg:.1f}")
-                
-                st.subheader("📅 Daily Counts")
-                counts = df['day'].value_counts().sort_index(ascending=False).rename_axis('Date').reset_index(name='Articles')
-                st.dataframe(counts, use_container_width=True)
+                st.divider()
                 
                 with st.expander("View Article List"):
                     st.dataframe(df.sort_values('date', ascending=False), use_container_width=True)
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button("Download CSV", csv, "articles.csv", "text/csv")
-            else:
-                st.error("No articles found. (Try providing a specific RSS feed link if this fails)")
+                    
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Critical Error: {e}")
     else:
-        st.warning("Enter a URL.")
+        st.warning("Please enter a URL.")
