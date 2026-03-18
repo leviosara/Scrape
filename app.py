@@ -40,7 +40,7 @@ def make_naive(dt):
     """Removes timezone info to prevent comparison errors."""
     if dt is None:
         return None
-    # If it has timezone info, remove it (convert to naive)
+    # If it has timezone info, remove it
     if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
         return dt.replace(tzinfo=None)
     return dt
@@ -60,7 +60,8 @@ def get_all_articles_aggressive(base_url):
             r = requests.get(domain + path, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
             if r.status_code == 200:
                 sitemaps.append(domain + path)
-        except: continue
+        except:
+            continue
 
     if not sitemaps:
         try:
@@ -68,7 +69,8 @@ def get_all_articles_aggressive(base_url):
             for line in r.text.split('\n'):
                 if 'Sitemap:' in line:
                     sitemaps.append(line.split('Sitemap:')[1].strip())
-        except: pass
+        except:
+            pass
 
     if not sitemaps:
         return None
@@ -81,7 +83,8 @@ def get_all_articles_aggressive(base_url):
     
     while sitemaps:
         sm = sitemaps.pop(0)
-        if sm in processed_sitemaps: continue
+        if sm in processed_sitemaps:
+            continue
         processed_sitemaps.add(sm)
 
         try:
@@ -92,7 +95,8 @@ def get_all_articles_aggressive(base_url):
                 for child in root:
                     locs = [c.text for c in child if 'loc' in str(c.tag).lower()]
                     for loc in locs:
-                        if loc: sitemaps.append(loc)
+                        if loc: 
+                            sitemaps.append(loc)
             
             elif 'urlset' in str(root.tag).lower():
                 for child in root:
@@ -100,8 +104,26 @@ def get_all_articles_aggressive(base_url):
                     date = None
                     
                     for c in child:
-                        if 'loc' in str(c.tag).lower(): loc = c.text
-                        if 'lastmod' in str(c.tag).lower(): date = c.text
+                        if 'loc' in str(c.tag).lower(): 
+                            loc = c.text
+                        if 'lastmod' in str(c.tag).lower(): 
+                            date = c.text
                     
                     if loc:
-                        urls_to_process
+                        urls_to_process.append((loc, date))
+                        
+        except Exception:
+            # If a specific sitemap fails, just skip it
+            continue
+    
+    progress.progress(100, text=f"Found {len(urls_to_process)} total links. Filtering...")
+
+    # 3. AGGRESSIVE DATE FINDING
+    cutoff_date = datetime.now() - timedelta(days=DAYS_TO_SCAN)
+    
+    found_articles = []
+    content_checks_done = 0
+    
+    for i, (url, xml_date) in enumerate(urls_to_process):
+        if i % 20 == 0:
+            progress.progress(int((i /
