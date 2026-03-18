@@ -5,14 +5,15 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import trafilatura
 import dateparser
+import re
 from datetime import datetime, timedelta
-from collections import defaultdict
 
 # --- CONFIGURATION ---
 DAYS_TO_SCAN = 7
-MAX_URLS_TO_CHECK_MANUALLY = 50  # Limit for slow content checks
+# Increased limit because we are determined to find articles
+MAX_CONTENT_CHECKS = 150 
 
-# --- CORE FUNCTIONS ---
+# --- HELPER FUNCTIONS ---
 
 def clean_url(url):
     url = url.strip()
@@ -20,22 +21,42 @@ def clean_url(url):
         url = 'https://' + url
     return url
 
-def get_articles_counts(base_url):
+def find_date_in_url(url):
+    """Attempts to find a date like 2023/10/25 in the URL string."""
+    # Regex for dates like YYYY/MM/DD or YYYY-MM-DD
+    patterns = [
+        r'/(\d{4})/(\d{1,2})/(\d{1,2})/',  # /2023/10/25/
+        r'/(\d{4})-(\d{1,2})-(\d{1,2})',   # /2023-10-25
+    ]
+    for pat in patterns:
+        match = re.search(pat, url)
+        if match:
+            date_str = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+            try:
+                return dateparser.parse(date_str)
+            except:
+                pass
+    return None
+
+# --- MAIN SCRAPER ---
+
+def get_all_articles_aggressive(base_url):
     parsed = urlparse(base_url)
     domain = f"{parsed.scheme}://{parsed.netloc}"
     
-    sm_paths = ["/sitemap.xml", "/sitemap_index.xml", "/post-sitemap.xml"]
+    sm_paths = ["/sitemap.xml", "/sitemap_index.xml", "/post-sitemap.xml", "/news-sitemap.xml"]
     sitemaps = []
+    all_candidates = [] # Store potential URLs here
     
-    # 1. Find Sitemaps
+    # 1. DISCOVER SITEMAPS
     for path in sm_paths:
         try:
             r = requests.get(domain + path, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
             if r.status_code == 200:
                 sitemaps.append(domain + path)
-                break
         except: continue
 
+    # Fallback to robots.txt
     if not sitemaps:
         try:
             r = requests.get(domain + "/robots.txt", timeout=5)
@@ -47,16 +68,13 @@ def get_articles_counts(base_url):
     if not sitemaps:
         return None
 
-    # 2. Parse and Extract Dates
+    # 2. GATHER ALL URLS
     processed_sitemaps = set()
-    articles_data = []
-    manual_check_queue = []
+    urls_to_process = [] # List of (url, potential_date)
     
-    cutoff_date = datetime.now() - timedelta(days=DAYS_TO_SCAN)
+    progress = st.progress(0, text="Step 1: Gathering all links from sitemap...")
+    count = 0
     
-    progress_bar = st.progress(0, text="Scanning sitemaps...")
-    urls_processed = 0
-
     while sitemaps:
         sm = sitemaps.pop(0)
         if sm in processed_sitemaps: continue
@@ -66,116 +84,123 @@ def get_articles_counts(base_url):
             r = requests.get(sm, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
             root = ET.fromstring(r.content)
             
-            # Sitemap Index (links to other sitemaps)
             if 'sitemapindex' in str(root.tag).lower():
                 for child in root:
                     locs = [c.text for c in child if 'loc' in str(c.tag).lower()]
                     for loc in locs:
                         if loc: sitemaps.append(loc)
             
-            # URL Set (actual pages)
             elif 'urlset' in str(root.tag).lower():
                 for child in root:
                     loc = None
-                    lastmod = None
+                    date = None
                     
                     for c in child:
                         if 'loc' in str(c.tag).lower(): loc = c.text
-                        if 'lastmod' in str(c.tag).lower(): lastmod = c.text
+                        if 'lastmod' in str(c.tag).lower(): date = c.text
                     
-                    if not loc: continue
-                    
-                    # Strategy 1: Fast path (Sitemap Date)
-                    if lastmod:
-                        try:
-                            art_date = dateparser.parse(lastmod)
-                            if art_date and art_date > cutoff_date:
-                                articles_data.append({'url': loc, 'date': art_date})
-                        except: pass
-                    # Strategy 2: Slow path (Check page content) - Limited
-                    elif len(manual_check_queue) < MAX_URLS_TO_CHECK_MANUALLY:
-                        manual_check_queue.append(loc)
+                    if loc:
+                        # Add to list with date (if found in XML) or None
+                        urls_to_process.append((loc, date))
+                        count += 1
                         
-                    urls_processed += 1
-                    if urls_processed % 50 == 0:
-                        progress_bar.progress(min(urls_processed / 500, 0.9), text=f"Scanned {urls_processed} links...")
-
         except: continue
-
-    progress_bar.progress(95, text="Checking content dates for recent links...")
     
-    # Process manual checks (if needed)
-    for loc in manual_check_queue:
-        try:
-            html = trafilatura.fetch_url(loc)
-            if html:
-                metadata = trafilatura.extract_metadata(html)
-                if metadata and metadata.date:
-                    art_date = dateparser.parse(metadata.date)
-                    if art_date and art_date > cutoff_date:
-                        articles_data.append({'url': loc, 'date': art_date})
-        except: pass
+    progress.progress(100, text=f"Found {len(urls_to_process)} total links. Filtering for last {DAYS_TO_SCAN} days...")
 
-    progress_bar.progress(100, text="Done.")
-    return articles_data
+    # 3. AGGRESSIVE DATE FINDING
+    cutoff_date = datetime.now() - timedelta(days=DAYS_TO_SCAN)
+    found_articles = []
+    content_checks_done = 0
+    
+    # Loop through found URLs
+    for i, (url, xml_date) in enumerate(urls_to_process):
+        # Update progress frequently
+        if i % 20 == 0:
+            progress.progress(int((i / len(urls_to_process)) * 100), text=f"Scanning {i}/{len(urls_to_process)}...")
+        
+        final_date = None
+        
+        # Strategy A: Date already found in Sitemap XML
+        if xml_date:
+            try:
+                final_date = dateparser.parse(xml_date)
+            except: pass
+        
+        # Strategy B: Date found in URL string (Very Fast)
+        if not final_date:
+            final_date = find_date_in_url(url)
+            
+        # Strategy C: Date found in Page Content (Slow, but we do it if needed)
+        # Only do this if we haven't hit our limit and we don't have a date yet
+        if not final_date and content_checks_done < MAX_CONTENT_CHECKS:
+            try:
+                html = trafilatura.fetch_url(url)
+                if html:
+                    metadata = trafilatura.extract_metadata(html)
+                    if metadata and metadata.date:
+                        final_date = dateparser.parse(metadata.date)
+                        content_checks_done += 1
+            except: pass
+        
+        # FINAL CHECK: Is it within our range?
+        if final_date:
+            if final_date > cutoff_date:
+                found_articles.append({
+                    'url': url,
+                    'date': final_date
+                })
+
+    progress.empty()
+    return found_articles
 
 # --- STREAMLIT UI ---
 
-st.set_page_config(page_title="7-Day Article Counter", layout="wide")
+st.set_page_config(page_title="Aggressive Article Finder", layout="wide")
 
-st.title("📊 7-Day Article Analyzer")
-st.write(f"Scans a website to find articles posted in the last **{DAYS_TO_SCAN} days**, counts them per day, and calculates the average.")
+st.title("🚀 Aggressive Article Finder")
+st.write(f"Forces search for articles in the last **{DAYS_TO_SCAN} days**, even if dates are hidden.")
 
 url_input = st.text_input("Website URL", placeholder="example.com")
 
-if st.button("Analyze Website"):
+if st.button("Find Articles"):
     if url_input:
         clean_input = clean_url(url_input)
-        st.info(f"Analyzing: `{clean_input}`...")
+        st.info(f"Scanning: `{clean_input}` ... Please wait, this might take a minute.")
         
         try:
-            results = get_articles_counts(clean_input)
+            results = get_all_articles_aggressive(clean_input)
             
             if results:
-                # Create DataFrame
                 df = pd.DataFrame(results)
-                
-                # Normalize dates (remove time) to group by day
                 df['day'] = df['date'].dt.date
                 
-                # 1. COUNT PER DAY
-                st.subheader("📅 Articles Per Day")
-                counts = df['day'].value_counts().sort_index(ascending=False).rename_axis('Date').reset_index(name='Articles Found')
+                # STATS
+                st.subheader("📊 Statistics")
                 
-                # Fill missing days with 0
-                today = datetime.now().date()
-                all_days = [today - timedelta(days=i) for i in range(DAYS_TO_SCAN)]
-                full_counts = pd.DataFrame({'Date': all_days})
-                full_counts = full_counts.merge(counts, on='Date', how='left').fillna(0)
-                full_counts['Articles Found'] = full_counts['Articles Found'].astype(int)
-                
-                st.dataframe(full_counts, use_container_width=True)
-                
-                # 2. CALCULATE AVERAGE
                 total_articles = len(df)
-                average_articles = total_articles / DAYS_TO_SCAN
+                average = total_articles / DAYS_TO_SCAN
                 
                 col1, col2 = st.columns(2)
-                col1.metric("Total Articles (7 Days)", total_articles)
-                col2.metric("Average Per Day", f"{average_articles:.2f}")
+                col1.metric("Total Articles Found", total_articles)
+                col2.metric("Average Per Day", f"{average:.2f}")
                 
-                # 3. SHOW RAW DATA
-                with st.expander("View Article List"):
-                    st.dataframe(df[['date', 'url']], use_container_width=True)
-
-                # Download
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("Download Article List", csv, "articles.csv", "text/csv")
+                # COUNT PER DAY
+                st.subheader("📅 Count Per Day")
+                counts = df['day'].value_counts().sort_index(ascending=False).rename_axis('Date').reset_index(name='Count')
+                st.dataframe(counts, use_container_width=True)
                 
+                # RAW DATA
+                with st.expander("See Full List of Articles"):
+                    df_display = df.sort_values('date', ascending=False)
+                    st.dataframe(df_display[['date', 'url']], use_container_width=True)
+                    
+                    csv = df.to_csv(index=False).encode('utf-8')
+                    st.download_button("Download CSV", csv, "articles.csv", "text/csv")
             else:
-                st.warning("No articles found in the last 7 days. The site might not provide dates or hasn't posted recently.")
-                
+                st.error("Scanned everything but found 0 articles in the last 7 days. The website might be blocking requests or uses a very strange format.")
+        
         except Exception as e:
-            st.error(f"An error occurred: {e}")
+            st.error(f"Critical Error: {e}")
     else:
         st.error("Please enter a URL.")
