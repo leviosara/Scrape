@@ -126,4 +126,94 @@ def get_all_articles_aggressive(base_url):
     
     for i, (url, xml_date) in enumerate(urls_to_process):
         if i % 20 == 0:
-            progress.progress(int((i /
+            progress.progress(int((i / len(urls_to_process)) * 100), text=f"Scanning {i}/{len(urls_to_process)}...")
+        
+        final_date = None
+        
+        # Strategy A: Sitemap XML Date
+        if xml_date:
+            try:
+                final_date = dateparser.parse(xml_date)
+            except:
+                pass
+        
+        # Strategy B: URL Date
+        if not final_date:
+            final_date = find_date_in_url(url)
+            
+        # Strategy C: Page Content
+        if not final_date and content_checks_done < MAX_CONTENT_CHECKS:
+            try:
+                html = trafilatura.fetch_url(url)
+                if html:
+                    metadata = trafilatura.extract_metadata(html)
+                    if metadata and metadata.date:
+                        final_date = dateparser.parse(metadata.date)
+                        content_checks_done += 1
+            except:
+                pass
+        
+        # FINAL CHECK
+        if final_date:
+            # FIX: Make date naive to match cutoff_date
+            final_date = make_naive(final_date)
+            
+            if final_date > cutoff_date:
+                found_articles.append({
+                    'url': url,
+                    'date': final_date
+                })
+
+    progress.empty()
+    return found_articles
+
+# --- STREAMLIT UI ---
+
+st.set_page_config(page_title="Aggressive Article Finder", layout="wide")
+
+st.title("🚀 Aggressive Article Finder")
+st.write(f"Forces search for articles in the last **{DAYS_TO_SCAN} days**.")
+
+url_input = st.text_input("Website URL", placeholder="example.com")
+
+if st.button("Find Articles"):
+    if url_input:
+        clean_input = clean_url(url_input)
+        st.info(f"Scanning: `{clean_input}` ...")
+        
+        try:
+            results = get_all_articles_aggressive(clean_input)
+            
+            if results:
+                df = pd.DataFrame(results)
+                df['day'] = df['date'].dt.date
+                
+                # STATS
+                st.subheader("📊 Statistics")
+                
+                total_articles = len(df)
+                average = total_articles / DAYS_TO_SCAN
+                
+                col1, col2 = st.columns(2)
+                col1.metric("Total Articles Found", total_articles)
+                col2.metric("Average Per Day", f"{average:.2f}")
+                
+                # COUNT PER DAY
+                st.subheader("📅 Count Per Day")
+                counts = df['day'].value_counts().sort_index(ascending=False).rename_axis('Date').reset_index(name='Count')
+                st.dataframe(counts, use_container_width=True)
+                
+                # RAW DATA
+                with st.expander("See Full List of Articles"):
+                    df_display = df.sort_values('date', ascending=False)
+                    st.dataframe(df_display[['date', 'url']], use_container_width=True)
+                    
+                    csv = df.to_csv(index=False).encode('utf-8')
+                    st.download_button("Download CSV", csv, "articles.csv", "text/csv")
+            else:
+                st.error("Scanned everything but found 0 articles in the last 7 days.")
+        
+        except Exception as e:
+            st.error(f"Critical Error: {e}")
+    else:
+        st.error("Please enter a URL.")
