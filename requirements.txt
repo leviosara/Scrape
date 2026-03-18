@@ -1,0 +1,6 @@
+streamlit
+requests
+feedparser
+trafilatura
+dateparser
+pandas
