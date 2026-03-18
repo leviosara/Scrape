@@ -3,7 +3,6 @@ import requests
 from urllib.parse import urlparse, urljoin
 import xml.etree.ElementTree as ET
 import pandas as pd
-import trafilatura
 import dateparser
 import re
 from datetime import datetime, timedelta
@@ -11,9 +10,6 @@ import feedparser
 
 # --- CONFIGURATION ---
 DAYS_TO_SCAN = 7
-MAX_SLOW_CHECKS = 50
-# Increased limit now that we filter out junk
-MAX_SITEMAP_FILES = 20 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
 # --- HELPER FUNCTIONS ---
@@ -31,6 +27,7 @@ def make_naive(dt):
     return dt
 
 def find_date_in_url(url):
+    # Matches YYYY/MM/DD or YYYY-MM-DD
     patterns = [r'/(\d{4})/(\d{1,2})/(\d{1,2})/', r'/(\d{4})-(\d{1,2})-(\d{1,2})']
     for pat in patterns:
         match = re.search(pat, url)
@@ -40,36 +37,12 @@ def find_date_in_url(url):
             except: pass
     return None
 
-def get_date_from_html(html):
-    if not html: return None
-    try:
-        metadata = trafilatura.extract_metadata(html)
-        if metadata and metadata.date: return dateparser.parse(metadata.date)
-    except: pass
-    match = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html)
-    if match: return dateparser.parse(match.group(1))
-    return None
-
-# --- SMART SITEMAP FILTER ---
-
-def is_junk_sitemap(url):
-    """Identifies sitemaps that are NOT articles (Tags, Authors, etc.)"""
-    url_lower = url.lower()
-    junk_words = ['tag', 'author', 'attachment', 'page', 'category', 'archive']
-    return any(word in url_lower for word in junk_words)
-
-def is_priority_sitemap(url):
-    """Identifies sitemaps that are highly valuable (Posts, News)"""
-    url_lower = url.lower()
-    priority_words = ['post', 'news', 'article', 'story', 'history', 'sport', 'investigation']
-    return any(word in url_lower for word in priority_words)
-
-# --- SCANNING STRATEGIES ---
+# --- SCANNING STRATEGIES (NO SLOW DOWNLOADS) ---
 
 def scan_rss_feeds(base_url, log_box):
-    log_box.text("⏳ Step 1: Checking RSS Feeds (Fastest)...")
+    log_box.text("⏳ Step 1: Checking RSS Feeds...")
     found = {}
-    paths = [f"{base_url}/feed/", f"{base_url}/rss/", f"{base_url}/en/feed/"]
+    paths = [f"{base_url}/feed/", f"{base_url}/rss/", f"{base_url}/en/feed/", f"{base_url}/uk/feed/"]
     
     for path in paths:
         try:
@@ -84,208 +57,35 @@ def scan_rss_feeds(base_url, log_box):
                             dt = datetime(*published[:6])
                             found[link] = dt
                     if found:
-                        log_box.text(f"✅ Success: Found {len(found)} articles in RSS Feed.")
+                        log_box.text(f"✅ RSS: Found {len(found)} articles.")
                         return found
         except: continue
-    log_box.text("⚠️ RSS Feed not found. Trying Sitemaps...")
     return found
 
-def scan_sitemaps(base_url, log_box):
-    log_box.text("⏳ Step 2: Discovering ALL Sitemaps...")
+def scan_sitemaps_fast(base_url, log_box):
+    log_box.text("⏳ Step 2: Scanning Sitemaps (Fast Mode)...")
     domain = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
     
-    # 1. Discover all sitemap URLs
-    sitemap_urls = set()
-    # Check robots.txt
-    try:
-        r = requests.get(f"{domain}/robots.txt", timeout=3, headers={'User-Agent': USER_AGENT})
-        for line in r.text.split('\n'):
-            if 'Sitemap:' in line: sitemap_urls.add(line.split('Sitemap:')[1].strip())
-    except: pass
+    # We prioritize specific sitemaps that usually have dates
+    priority_paths = [
+        "/post-sitemap.xml", "/news-sitemap.xml", "/sitemap-news.xml",
+        "/sitemap.xml", "/sitemap_index.xml"
+    ]
     
-    # Check standard index
-    try:
-        r = requests.get(f"{domain}/sitemap.xml", timeout=3)
-        root = ET.fromstring(r.content)
-        # If it's an index, get all children
-        if 'sitemapindex' in str(root.tag).lower():
-            for c in root:
-                locs = [x.text for x in c if 'loc' in str(x.tag).lower()]
-                for l in locs: sitemap_urls.add(l)
-        else:
-            sitemap_urls.add(f"{domain}/sitemap.xml")
-    except: pass
-
-    log_box.text(f"🔎 Found {len(sitemap_urls)} total sitemap files. Filtering...")
-
-    # 2. SMART FILTERING
-    # Separate into Priority and Others
-    priority_maps = []
-    other_maps = []
-    
-    for url in sitemap_urls:
-        if is_junk_sitemap(url):
-            continue # Skip tags/authors completely
-        if is_priority_sitemap(url):
-            priority_maps.append(url)
-        else:
-            other_maps.append(url)
-    
-    # Combine: Priority first, then others (up to limit)
-    final_sitemaps = priority_maps + other_maps
-    final_sitemaps = final_sitemaps[:MAX_SITEMAP_FILES]
-    
-    log_box.text(f"🎯 Selected {len(final_sitemaps)} relevant sitemaps to scan (Posts, News, etc.).")
-
-    # 3. Scan Selected Sitemaps
     found = {}
-    processed = set()
     
-    for sm in final_sitemaps:
-        if sm in processed: continue
-        processed.add(sm)
-        
-        # Log which file we are scanning
-        log_box.text(f"   📄 Scanning: {sm.split('/')[-1]}")
-        
+    for path in priority_paths:
         try:
-            r = requests.get(sm, timeout=5, headers={'User-Agent': USER_AGENT})
+            r = requests.get(domain + path, timeout=3, headers={'User-Agent': USER_AGENT})
+            if r.status_code != 200: continue
+            
             root = ET.fromstring(r.content)
             
-            # Handle nested indexes
+            # If it's an index, we just grab the first few links to other sitemaps
             if 'sitemapindex' in str(root.tag).lower():
-                for c in root:
-                    locs = [x.text for x in c if 'loc' in str(x.tag).lower()]
-                    for l in locs:
-                        # Recursively add, but strictly limit depth
-                        if l not in processed: final_sitemaps.append(l) 
-            
-            elif 'urlset' in str(root.tag).lower():
-                for c in root:
-                    url = None; dt = None
-                    for x in c:
-                        if 'loc' in str(x.tag).lower(): url = x.text
-                        if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
-                    if url:
-                        found[url] = dt
-                        
-        except Exception as e:
-            log_box.text(f"   ⚠️ Error on {sm}: {str(e)[:20]}")
-            continue
-        
-    log_box.text(f"✅ Sitemap scan finished. Found {len(found)} URLs.")
-    return found
-
-def scan_homepage(base_url, log_box):
-    log_box.text("⏳ Step 3: Scanning Homepage for recent links...")
-    found = {}
-    try:
-        r = requests.get(base_url, timeout=5, headers={'User-Agent': USER_AGENT})
-        links = re.findall(r'href=["\']([^"\']+)["\']', r.text)
-        domain_netloc = urlparse(base_url).netloc
-        for link in links:
-            full = urljoin(base_url, link)
-            if urlparse(full).netloc == domain_netloc:
-                if not any(x in full.lower() for x in ['.jpg', '.png', '.css', '/tag/', '/category/']):
-                    found[full] = None
-        log_box.text(f"✅ Homepage scan finished. Found {len(found)} links.")
-    except: pass
-    return found
-
-# --- MAIN ORCHESTRATOR ---
-
-def run_analysis(url):
-    cutoff = datetime.now() - timedelta(days=DAYS_TO_SCAN)
-    
-    # 1. Gather Candidates
-    log_box = st.empty()
-    rss_articles = scan_rss_feeds(url, log_box)
-    sitemap_articles = scan_sitemaps(url, log_box)
-    homepage_articles = scan_homepage(url, log_box)
-    
-    # Merge: RSS > Sitemap > Homepage
-    all_candidates = homepage_articles.copy()
-    all_candidates.update(sitemap_articles)
-    all_candidates.update(rss_articles)
-    
-    candidates_list = list(all_candidates.items())
-    
-    # 2. Verify Dates
-    log_box.text(f"🔎 Verifying dates for {len(candidates_list)} links...")
-    
-    results = []
-    progress = st.progress(0)
-    slow_checks_done = 0
-    
-    for i, (link, known_date) in enumerate(candidates_list):
-        if i % 10 == 0:
-            progress.progress(int((i / len(candidates_list)) * 100))
-        
-        final_date = known_date
-        
-        if final_date:
-            final_date = make_naive(final_date)
-            if final_date > cutoff:
-                results.append({'url': link, 'date': final_date})
-            continue
-
-        # If NO date, try to find it quickly
-        final_date = find_date_in_url(link)
-        
-        if not final_date and slow_checks_done < MAX_SLOW_CHECKS:
-            slow_checks_done += 1
-            try:
-                html = trafilatura.fetch_url(link)
-                final_date = get_date_from_html(html)
-            except: pass
-        
-        if final_date:
-            final_date = make_naive(final_date)
-            if final_date > cutoff:
-                results.append({'url': link, 'date': final_date})
-                
-    log_box.text(f"✅ Analysis Complete. Found {len(results)} valid articles.")
-    progress.empty()
-    return results
-
-# --- UI ---
-
-st.set_page_config(page_title="Smart News Scanner", layout="wide")
-
-st.title("📰 Smart News Scanner")
-st.write("Filters sitemaps to prioritize **News, Posts, and Categories** while ignoring Tags/Authors.")
-
-url_input = st.text_input("Website URL", placeholder="https://rayon.in.ua/")
-
-if st.button("Run Smart Scan"):
-    if url_input:
-        try:
-            results = run_analysis(clean_url(url_input))
-            
-            if results:
-                df = pd.DataFrame(results)
-                df['day'] = df['date'].dt.date
-                
-                total = len(df)
-                avg = total / DAYS_TO_SCAN
-                
-                st.success(f"Success! Found {total} articles.")
-                
-                c1, c2 = st.columns(2)
-                c1.metric("Total Articles", total)
-                c2.metric("Daily Average", f"{avg:.1f}")
-                
-                st.subheader("📅 Daily Counts")
-                counts = df['day'].value_counts().sort_index(ascending=False).rename_axis('Date').reset_index(name='Articles')
-                st.dataframe(counts, use_container_width=True)
-                
-                with st.expander("View Article List"):
-                    st.dataframe(df.sort_values('date', ascending=False), use_container_width=True)
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button("Download CSV", csv, "articles.csv", "text/csv")
-            else:
-                st.error("No articles found.")
-        except Exception as e:
-            st.error(f"Error: {e}")
-    else:
-        st.warning("Enter a URL.")
+                # Quick check: does the index list other sitemaps?
+                # We will just check the FIRST 3 child sitemaps found in the index
+                count = 0
+                for child in root:
+                    if count >= 3: break # Strict limit for speed
+                    loc = [c.text for c in child if 'loc'
