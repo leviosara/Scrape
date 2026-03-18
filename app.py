@@ -1,102 +1,231 @@
-import streamlit as st
 import requests
-import feedparser
+from urllib.parse import urlparse, urljoin
 import trafilatura
 import dateparser
 import pandas as pd
-from datetime import date, datetime
-from urllib.parse import urlparse
+from datetime import datetime, date, timedelta
+import xml.etree.ElementTree as ET
+import re
+import time
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Universal News Analyzer", layout="wide")
+TARGETS = [
+    "https://most.ks.ua/",
+    "https://v-variant.com.ua/",
+    "https://realgazeta.com.ua/",
+    "https://cukr.city/"
+]
+DAYS_TO_SCAN = 7
 
-# --- CORE LOGIC ---
-def get_today_date():
-    return date.today()
+# --- CORE FUNCTIONS ---
 
-def check_rss(url):
-    base = urlparse(url)
-    paths = ['/feed', '/rss', '/feed.xml', '/?feed=rss2', f"{url}?format=rss"] # Added SQSP
-    for path in paths:
-        feed_url = f"{base.scheme}://{base.netloc}{path}" if path.startswith('/') else path
+def get_sitemap_urls(base_url):
+    """
+    Tries to find sitemap.xml or sitemap index.
+    This is the most reliable way to find 'everything'.
+    """
+    parsed = urlparse(base_url)
+    domain = f"{parsed.scheme}://{parsed.netloc}"
+    
+    # Common sitemap locations
+    sm_paths = [
+        "/sitemap.xml", 
+        "/sitemap_index.xml", 
+        "/sitemap-1.xml",
+        "/news-sitemap.xml",
+        "/post-sitemap.xml",
+        "/sitemap.xml.gz"
+    ]
+    
+    sitemaps = []
+    found_urls = []
+    
+    # 1. Find sitemap file
+    for path in sm_paths:
         try:
-            resp = requests.get(feed_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-            if resp.status_code == 200 and ('<rss' in resp.text or '<feed' in resp.text):
-                return parse_rss(resp.text)
+            r = requests.get(domain + path, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code == 200:
+                sitemaps.append(domain + path)
+                break
         except: continue
-    return []
 
-def parse_rss(xml_text):
-    feed = feedparser.parse(xml_text)
-    articles = []
-    today = get_today_date()
-    for entry in feed.entries:
-        dt = None
-        if hasattr(entry, 'published_parsed') and entry.published_parsed:
-            dt = datetime(*entry.published_parsed[:6]).date()
-        elif hasattr(entry, 'published'):
-            dt = dateparser.parse(entry.published).date()
-        
-        if dt == today:
-            articles.append({'url': entry.link, 'title': entry.title, 'date': dt})
-    return articles
-
-def analyze_content(url_list):
-    data = []
-    progress_bar = st.progress(0)
-    for i, item in enumerate(url_list):
-        progress_bar.progress((i + 1) / len(url_list))
+    if not sitemaps:
+        # Try robots.txt
         try:
-            downloaded = trafilatura.fetch_url(item['url'])
-            if not downloaded: continue
-            text = trafilatura.extract(downloaded, favor_precision=True)
-            if not text: continue
-            
-            tokens = len(text) // 4
-            data.append({
-                'Title': item['title'][:60] + "...",
-                'Chars': len(text),
-                'Tokens': tokens,
-                'URL': item['url']
-            })
+            r = requests.get(domain + "/robots.txt", timeout=5)
+            for line in r.text.split('\n'):
+                if 'Sitemap:' in line:
+                    sitemaps.append(line.split('Sitemap:')[1].strip())
         except: pass
-    progress_bar.empty()
-    return data
 
-# --- UI ---
-st.title("📰 Universal News Analyzer")
-st.write("Enter a news website URL to see exactly what was posted **today**.")
-
-url = st.text_input("Website URL", placeholder="https://most.ks.ua or https://example.com")
-
-if st.button("Analyze Today's Content"):
-    if not url:
-        st.warning("Please enter a URL")
-    else:
-        with st.spinner("Scanning for RSS feeds and analyzing..."):
-            # 1. Try RSS
-            found = check_rss(url)
+    # 2. Parse Sitemap (handles indexes and simple maps)
+    for sm in sitemaps:
+        try:
+            r = requests.get(sm, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            root = ET.fromstring(r.content)
             
-            # 2. If nothing, inform user
-            if not found:
-                st.error("No RSS feed found for this site, or no articles posted today.")
+            # Handle Sitemap Index (list of other sitemaps)
+            if 'sitemapindex' in str(root.tag).lower():
+                for child in root:
+                    loc = [c.text for c in child if 'loc' in c.tag.lower()]
+                    if loc:
+                        # Recursively fetch child sitemap
+                        try:
+                            r2 = requests.get(loc[0], timeout=5)
+                            root2 = ET.fromstring(r2.content)
+                            parse_sitemap_xml(root2, found_urls)
+                        except: pass
             else:
-                st.success(f"Found {len(found)} articles published today!")
+                # Direct URL list
+                parse_sitemap_xml(root, found_urls)
                 
-                # 3. Analyze content
-                df_data = analyze_content(found)
-                
-                if df_data:
-                    df = pd.DataFrame(df_data)
-                    
-                    # Metrics
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Articles Today", len(df))
-                    col2.metric("Total Chars", df['Chars'].sum())
-                    col3.metric("Total Tokens (Est)", df['Tokens'].sum())
-                    
-                    st.dataframe(df, use_container_width=True)
-                    
-                    # CSV Export
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button("Download CSV", csv, "report.csv", "text/csv")
+        except Exception as e:
+            continue
+            
+    return found_urls
+
+def parse_sitemap_xml(root, url_list):
+    """Extracts URLs and LastMod dates from XML"""
+    today = date.today()
+    cutoff = today - timedelta(days=DAYS_TO_SCAN)
+    
+    for child in root:
+        loc = None
+        last_mod = None
+        
+        for c in child:
+            if 'loc' in c.tag.lower(): loc = c.text
+            if 'lastmod' in c.tag.lower(): last_mod = c.text
+        
+        if loc:
+            # Filter Date
+            if last_mod:
+                try:
+                    dt = dateparser.parse(last_mod).date()
+                    if dt >= cutoff:
+                        url_list.append({'url': loc, 'date': dt})
+                except:
+                    # If date is weird, include it but mark unknown
+                    url_list.append({'url': loc, 'date': None})
+            else:
+                # No date? We might skip, or keep and check header.
+                # For "Everything", let's check header later if needed, 
+                # but for speed we skip sitemap items without dates unless it's recent.
+                pass
+
+def analyze_site(site_url):
+    print(f"\n{'='*50}")
+    print(f"DEEP SCANNING: {site_url}")
+    print(f"{'='*50}")
+    
+    # 1. Get URLs from Sitemaps
+    print("[*] Checking Sitemaps...")
+    candidates = get_sitemap_urls(site_url)
+    
+    # 2. Fallback to RSS if Sitemap failed
+    if not candidates:
+        print("[!] Sitemap empty or not found. Trying RSS...")
+        # Simple RSS fetch logic
+        parsed = urlparse(site_url)
+        paths = ['/feed', '/rss', '/feed.xml']
+        for p in paths:
+            try:
+                r = requests.get(f"{parsed.scheme}://{parsed.netloc}{p}", timeout=5)
+                if '<rss' in r.text:
+                    import feedparser
+                    feed = feedparser.parse(r.text)
+                    cutoff = date.today() - timedelta(days=DAYS_TO_SCAN)
+                    for e in feed.entries:
+                        if hasattr(e, 'published_parsed'):
+                            dt = datetime(*e.published_parsed[:6]).date()
+                            if dt >= cutoff:
+                                candidates.append({'url': e.link, 'date': dt})
+                    break
+            except: pass
+
+    print(f"[*] Found {len(candidates)} links published in last {DAYS_TO_SCAN} days.")
+    
+    if not candidates:
+        print("[-] No content found.")
+        return None
+
+    # 3. Analyze Content (Go over EVERYTHING)
+    data = []
+    total_links = len(candidates)
+    
+    for i, item in enumerate(candidates):
+        url = item['url']
+        
+        # Skip attachments
+        if any(x in url.lower() for x in ['.jpg', '.png', '.gif', '.pdf', '.zip', '.webp']):
+            continue
+            
+        # Progress
+        if i % 5 == 0:
+            print(f"    Processing {i+1}/{total_links}...", end='\r')
+        
+        try:
+            # Download
+            downloaded = trafilatura.fetch_url(url)
+            if not downloaded: continue
+            
+            # Extract Text
+            text = trafilatura.extract(downloaded, favor_precision=True)
+            if not text or len(text) < 150: continue # Skip short snippets
+            
+            # Calculate
+            tokens = len(text) // 4
+            
+            # Verify Date if missing (use sitemap date)
+            pub_date = item['date']
+            
+            data.append({
+                'date': pub_date,
+                'chars': len(text),
+                'tokens': tokens,
+                'url': url
+            })
+        except:
+            pass
+            
+    print(f"\n[+] Successfully analyzed {len(data)} content pages.")
+    return pd.DataFrame(data)
+
+# --- EXECUTION ---
+final_results = {}
+
+for target in TARGETS:
+    df = analyze_site(target)
+    if df is not None and not df.empty:
+        final_results[target] = df
+    time.sleep(2) # Polite pause
+
+# --- FINAL REPORT ---
+print("\n\n" + "="*60)
+print(" DAILY AVERAGE REPORT (LAST 7 DAYS) ")
+print("="*60)
+
+for site, df in final_results.items():
+    print(f"\nSITE: {site}")
+    
+    # Fill missing dates with mode or 'Unknown'
+    df['date'] = df['date'].fillna(date.today()) # just in case
+    
+    # Aggregate by Date
+    daily = df.groupby('date').agg(
+        Articles=('chars', 'count'),
+        Total_Chars=('chars', 'sum'),
+        Total_Tokens=('tokens', 'sum')
+    ).reset_index()
+    
+    # Calculate Averages
+    avg_articles = daily['Articles'].mean()
+    avg_chars = daily['Total_Chars'].mean()
+    avg_tokens = daily['Total_Tokens'].mean()
+    
+    print(f" - Average Articles per Day: {avg_articles:.1f}")
+    print(f" - Average Chars per Day:    {int(avg_chars):,}")
+    print(f" - Average Tokens per Day:   {int(avg_tokens):,}")
+    
+    print(" Daily Breakdown:")
+    print(daily.sort_values('date', ascending=False).to_string(index=False))
