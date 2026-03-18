@@ -1,3 +1,14 @@
+import streamlit as st
+import requests
+from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+import pandas as pd
+
+# --- CONFIGURATION ---
+DAYS_TO_SCAN = 7
+
+# --- CORE FUNCTIONS ---
+
 def get_sitemap_urls(base_url):
     parsed = urlparse(base_url)
     domain = f"{parsed.scheme}://{parsed.netloc}"
@@ -25,7 +36,6 @@ def get_sitemap_urls(base_url):
         except: pass
 
     # 2. Parse Sitemap
-    # Use a set to avoid processing the same sitemap twice
     processed_sitemaps = set()
 
     while sitemaps:
@@ -41,7 +51,7 @@ def get_sitemap_urls(base_url):
             # Check if it is a Sitemap Index (contains links to other sitemaps)
             if 'sitemapindex' in str(root.tag).lower():
                 for child in root:
-                    # CORRECTED LINE: Extract loc text properly
+                    # Extract loc text
                     locs = [c.text for c in child if 'loc' in str(c.tag).lower()]
                     for loc in locs:
                         if loc:
@@ -50,14 +60,41 @@ def get_sitemap_urls(base_url):
             # Check if it is a URL Set (contains actual page links)
             elif 'urlset' in str(root.tag).lower():
                 for child in root:
-                    # CORRECTED LINE: Extract loc text properly
                     locs = [c.text for c in child if 'loc' in str(c.tag).lower()]
                     for loc in locs:
                         if loc:
                             found_urls.append(loc)
                             
         except Exception as e:
-            # Ignore errors for individual sitemaps
             continue
 
     return found_urls
+
+# --- STREAMLIT UI ---
+
+st.set_page_config(page_title="Sitemap Scraper", layout="wide")
+
+st.title("🕷️ Sitemap URL Scraper")
+st.write("Enter a website URL to extract all links found in its sitemap.")
+
+# Input field
+url_input = st.text_input("Enter Website URL", placeholder="https://example.com")
+
+if st.button("Scan Sitemap"):
+    if url_input:
+        with st.spinner("Scanning sitemap... This may take a moment."):
+            try:
+                urls = get_sitemap_urls(url_input)
+                
+                if urls:
+                    st.success(f"Found {len(urls)} URLs!")
+                    
+                    # Display as a dataframe for better readability
+                    df = pd.DataFrame(urls, columns=["Found URLs"])
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.warning("No URLs found. The site might not have a sitemap or it is inaccessible.")
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+    else:
+        st.error("Please enter a URL.")
