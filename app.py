@@ -20,7 +20,6 @@ def clean_url(url):
     url = url.strip()
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
-    # Ensure no trailing slash for path joining consistency
     return url.rstrip('/')
 
 def make_naive(dt):
@@ -66,7 +65,7 @@ def get_date_from_html(html):
 
 # --- SCANNING STRATEGIES ---
 
-def scan_rss feeds(base_url, status_placeholder):
+def scan_rss_feeds(base_url, status_placeholder):
     """Strategy 1: Check RSS Feeds (Best for dates)"""
     status_placeholder.text("Strategy 1: Checking RSS Feeds (Most Accurate)...")
     found = {}
