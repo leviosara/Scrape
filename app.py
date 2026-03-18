@@ -166,4 +166,76 @@ def run_analysis(url):
     for i, (link, known_date) in enumerate(candidates_list):
         # Update progress
         if i % 10 == 0:
-            progress.progress(int((
+            progress.progress(int((i / len(candidates_list)) * 100))
+        
+        final_date = known_date
+        
+        # If we have a date, verify it's recent
+        if final_date:
+            final_date = make_naive(final_date)
+            if final_date > cutoff:
+                results.append({'url': link, 'date': final_date})
+            continue
+
+        # If NO date, try to find it quickly
+        # A. Check URL
+        final_date = find_date_in_url(link)
+        
+        # B. Check Content (ONLY if we haven't done too many)
+        if not final_date and slow_checks_done < MAX_SLOW_CHECKS:
+            slow_checks_done += 1
+            try:
+                html = trafilatura.fetch_url(link)
+                final_date = get_date_from_html(html)
+            except: pass
+        
+        if final_date:
+            final_date = make_naive(final_date)
+            if final_date > cutoff:
+                results.append({'url': link, 'date': final_date})
+                
+    log_box.text(f"✅ Analysis Complete. Found {len(results)} valid articles.")
+    progress.empty()
+    return results
+
+# --- UI ---
+
+st.set_page_config(page_title="Fast Scanner", layout="wide")
+
+st.title("⚡ Fast Article Scanner")
+st.write(f"Scans RSS, Sitemaps, and Homepage. Limits deep checks to {MAX_SLOW_CHECKS} pages to ensure speed.")
+
+url_input = st.text_input("Website URL", placeholder="https://most.ks.ua/en/")
+
+if st.button("Run Fast Scan"):
+    if url_input:
+        try:
+            results = run_analysis(clean_url(url_input))
+            
+            if results:
+                df = pd.DataFrame(results)
+                df['day'] = df['date'].dt.date
+                
+                total = len(df)
+                avg = total / DAYS_TO_SCAN
+                
+                st.success(f"Success! Found {total} articles.")
+                
+                c1, c2 = st.columns(2)
+                c1.metric("Total Articles", total)
+                c2.metric("Daily Average", f"{avg:.1f}")
+                
+                st.subheader("📅 Daily Counts")
+                counts = df['day'].value_counts().sort_index(ascending=False).rename_axis('Date').reset_index(name='Articles')
+                st.dataframe(counts, use_container_width=True)
+                
+                with st.expander("View Article List"):
+                    st.dataframe(df.sort_values('date', ascending=False), use_container_width=True)
+                    csv = df.to_csv(index=False).encode('utf-8')
+                    st.download_button("Download CSV", csv, "articles.csv", "text/csv")
+            else:
+                st.error("No articles found. Check the logs above.")
+        except Exception as e:
+            st.error(f"Error: {e}")
+    else:
+        st.warning("Enter a URL.")
