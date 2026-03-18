@@ -10,7 +10,8 @@ from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
 DAYS_TO_SCAN = 7
-MAX_CONTENT_CHECKS = 150 
+# Increased limit: check up to 500 individual pages if sitemap lacks dates
+MAX_CONTENT_CHECKS = 500 
 
 # --- HELPER FUNCTIONS ---
 
@@ -40,10 +41,21 @@ def make_naive(dt):
     """Removes timezone info to prevent comparison errors."""
     if dt is None:
         return None
-    # If it has timezone info, remove it
     if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
         return dt.replace(tzinfo=None)
     return dt
+
+def is_likely_article(url):
+    """Filter out tags, categories, and other junk to save scan time."""
+    url_lower = url.lower()
+    # Skip common non-article paths
+    skip_patterns = ['/tag/', '/category/', '/author/', '/page/', 
+                     '/feed/', '/comment', '/amp/', 'replytocom', 
+                     '.jpg', '.png', '.gif', '.pdf']
+    for pattern in skip_patterns:
+        if pattern in url_lower:
+            return False
+    return True
 
 # --- MAIN SCRAPER ---
 
@@ -51,7 +63,8 @@ def get_all_articles_aggressive(base_url):
     parsed = urlparse(base_url)
     domain = f"{parsed.scheme}://{parsed.netloc}"
     
-    sm_paths = ["/sitemap.xml", "/sitemap_index.xml", "/post-sitemap.xml", "/news-sitemap.xml"]
+    sm_paths = ["/sitemap.xml", "/sitemap_index.xml", "/post-sitemap.xml", 
+                "/news-sitemap.xml", "/sitemap-news.xml"]
     sitemaps = []
     
     # 1. DISCOVER SITEMAPS
@@ -108,17 +121,23 @@ def get_all_articles_aggressive(base_url):
                             loc = c.text
                         if 'lastmod' in str(c.tag).lower(): 
                             date = c.text
+                        # Check for 'news:publication_date' often used in news sitemaps
+                        if 'publication_date' in str(c.tag).lower(): 
+                            date = c.text
                     
                     if loc:
-                        urls_to_process.append((loc, date))
+                        # Filter: only keep URLs that look like articles
+                        if is_likely_article(loc):
+                            urls_to_process.append((loc, date))
                         
         except Exception:
-            # If a specific sitemap fails, just skip it
             continue
     
-    progress.progress(100, text=f"Found {len(urls_to_process)} total links. Filtering...")
+    # Remove duplicates just in case
+    urls_to_process = list(set(urls_to_process))
+    progress.progress(100, text=f"Found {len(urls_to_process)} candidate links. Analyzing dates...")
 
-    # 3. AGGRESSIVE DATE FINDING
+    # 3. DATE FINDING
     cutoff_date = datetime.now() - timedelta(days=DAYS_TO_SCAN)
     
     found_articles = []
@@ -126,11 +145,12 @@ def get_all_articles_aggressive(base_url):
     
     for i, (url, xml_date) in enumerate(urls_to_process):
         if i % 20 == 0:
-            progress.progress(int((i / len(urls_to_process)) * 100), text=f"Scanning {i}/{len(urls_to_process)}...")
+            pct = int((i / len(urls_to_process)) * 100)
+            progress.progress(pct, text=f"Analyzing {i}/{len(urls_to_process)}...")
         
         final_date = None
         
-        # Strategy A: Sitemap XML Date
+        # Strategy A: Sitemap Date (Fastest)
         if xml_date:
             try:
                 final_date = dateparser.parse(xml_date)
@@ -141,7 +161,7 @@ def get_all_articles_aggressive(base_url):
         if not final_date:
             final_date = find_date_in_url(url)
             
-        # Strategy C: Page Content
+        # Strategy C: Page Content (Slowest - only if needed)
         if not final_date and content_checks_done < MAX_CONTENT_CHECKS:
             try:
                 html = trafilatura.fetch_url(url)
@@ -149,13 +169,20 @@ def get_all_articles_aggressive(base_url):
                     metadata = trafilatura.extract_metadata(html)
                     if metadata and metadata.date:
                         final_date = dateparser.parse(metadata.date)
-                        content_checks_done += 1
+                    
+                    # Fallback: Search for JSON-LD date if metadata failed
+                    if not final_date:
+                        # Simple regex to find "datePublished" in HTML source
+                        match = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html)
+                        if match:
+                            final_date = dateparser.parse(match.group(1))
+                            
+                    content_checks_done += 1
             except:
                 pass
         
         # FINAL CHECK
         if final_date:
-            # FIX: Make date naive to match cutoff_date
             final_date = make_naive(final_date)
             
             if final_date > cutoff_date:
@@ -169,17 +196,17 @@ def get_all_articles_aggressive(base_url):
 
 # --- STREAMLIT UI ---
 
-st.set_page_config(page_title="Aggressive Article Finder", layout="wide")
+st.set_page_config(page_title="Deep Article Finder", layout="wide")
 
-st.title("🚀 Aggressive Article Finder")
-st.write(f"Forces search for articles in the last **{DAYS_TO_SCAN} days**.")
+st.title("📰 Deep Article Finder")
+st.write(f"Scans deeply to find articles from the last **{DAYS_TO_SCAN} days**.")
 
 url_input = st.text_input("Website URL", placeholder="example.com")
 
 if st.button("Find Articles"):
     if url_input:
         clean_input = clean_url(url_input)
-        st.info(f"Scanning: `{clean_input}` ...")
+        st.info(f"Scanning: `{clean_input}` ... (This may take a minute for large sites)")
         
         try:
             results = get_all_articles_aggressive(clean_input)
