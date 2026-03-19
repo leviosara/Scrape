@@ -1,35 +1,49 @@
 import streamlit as st
 import feedparser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 st.set_page_config(page_title="News Article Counter", layout="wide")
 
-st.title("📰 News Media Daily Article Counter")
+st.title("📰 News Media Article Counter (Last 3 Days)")
 
-st.write("Paste news website RSS feeds (one per line). The app will count how many articles were published today.")
+st.write("Paste RSS feeds. The app will count how many articles were published in the last 3 days.")
 
-# Input box
+# Input
 rss_input = st.text_area(
     "Enter RSS feed URLs:",
     placeholder="https://rss.cnn.com/rss/edition.rss\nhttps://feeds.bbci.co.uk/news/rss.xml",
     height=150
 )
 
-def count_today_articles(feed_url):
+def analyze_feed(feed_url):
     try:
         feed = feedparser.parse(feed_url)
-        today = datetime.now(timezone.utc).date()
-        count = 0
+        now = datetime.now(timezone.utc)
+        three_days_ago = now - timedelta(days=3)
+
+        total_count = 0
+        daily_counts = {}
+
+        for i in range(3):
+            day = (now - timedelta(days=i)).date()
+            daily_counts[str(day)] = 0
 
         for entry in feed.entries:
             if hasattr(entry, "published_parsed") and entry.published_parsed:
-                published_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).date()
-                if published_date == today:
-                    count += 1
+                published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
 
-        return count, None
+                if published >= three_days_ago:
+                    total_count += 1
+                    day_str = str(published.date())
+
+                    if day_str in daily_counts:
+                        daily_counts[day_str] += 1
+
+        return total_count, daily_counts, None
+
     except Exception as e:
-        return 0, str(e)
+        return 0, {}, str(e)
+
 
 if st.button("Analyze"):
     if not rss_input.strip():
@@ -37,23 +51,19 @@ if st.button("Analyze"):
     else:
         feeds = [line.strip() for line in rss_input.split("\n") if line.strip()]
 
-        results = []
-
         with st.spinner("Fetching data..."):
             for feed in feeds:
-                count, error = count_today_articles(feed)
+                total, daily, error = analyze_feed(feed)
 
-                results.append({
-                    "Feed": feed,
-                    "Articles Today": count,
-                    "Error": error
-                })
+                st.markdown(f"## 🔗 {feed}")
 
-        st.subheader("📊 Results")
+                if error:
+                    st.error(f"Error: {error}")
+                else:
+                    st.success(f"Total articles (last 3 days): **{total}**")
 
-        for res in results:
-            st.markdown(f"### 🔗 {res['Feed']}")
-            if res["Error"]:
-                st.error(f"Error: {res['Error']}")
-            else:
-                st.success(f"Articles published today: **{res['Articles Today']}**")
+                    st.markdown("### 📅 Breakdown by day:")
+                    for day, count in sorted(daily.items(), reverse=True):
+                        st.write(f"{day} → {count} articles")
+
+                st.divider()
