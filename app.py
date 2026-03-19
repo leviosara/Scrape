@@ -7,15 +7,15 @@ import dateparser
 import re
 from datetime import datetime, timedelta
 import feedparser
+import trafilatura
 
 # --- CONFIGURATION ---
 CURRENT_DATE = datetime.now().date()
-# Window: Start from 3 days ago (00:00:00)
 START_DATE = datetime.combine(CURRENT_DATE - timedelta(days=3), datetime.min.time())
-# Window: End at the start of today (00:00:00) - effectively excluding today
 END_DATE = datetime.combine(CURRENT_DATE, datetime.min.time())
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+SAMPLE_SIZE = 5  # How many articles to check for content stats
 
 # --- HELPER FUNCTIONS ---
 
@@ -47,29 +47,49 @@ def is_real_article(url):
     path = parsed.path.rstrip('/')
     
     if not path or path == '/': return False
-    
-    # 1. Extensions
     if any(url_lower.endswith(ext) for ext in ['.jpg', '.png', '.gif', '.pdf', '.css', '.js', '.xml', '.zip']):
         return False
-
-    # 2. STRICT TAG FILTER
-    # If the path contains '/tag/' or '/tags/', it is NOT an article.
-    # Also blocking 'topic' and 'label' which are common synonyms for tags.
+    
+    # Strict Tag/Topic Filter
     if any(x in path for x in ['/tag/', '/tags/', '/topic/', '/label/']):
         return False
 
-    # 3. Category Words (Last segment check)
     last_segment = path.split('/')[-1]
     forbidden_slugs = [
         'promo', 'city', 'news', 'sport', 'science', 'politics', 'world', 
         'society', 'economics', 'culture', 'life', 'style', 'video', 'photo',
         'archive', 'archives', 'author', 'category', 'page',
-        'search', 'feed', 'rss', 'amp', 'ukraine', 'kyiv', 'contacts', 'about',
-        'tag', 'tags', 'topic', 'label'
+        'search', 'feed', 'rss', 'amp', 'ukraine', 'kyiv', 'contacts', 'about'
     ]
     if last_segment in forbidden_slugs: return False
 
     return True
+
+def analyze_content(urls):
+    """Downloads and analyzes a sample of URLs for character/token counts."""
+    total_chars = 0
+    total_words = 0
+    successful_checks = 0
+    
+    for url in urls:
+        try:
+            downloaded = trafilatura.fetch_url(url)
+            if downloaded:
+                text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
+                if text:
+                    total_chars += len(text)
+                    total_words += len(text.split())
+                    successful_checks += 1
+        except: continue
+            
+    if successful_checks == 0: return None
+    
+    return {
+        'avg_chars': int(total_chars / successful_checks),
+        'avg_words': int(total_words / successful_checks),
+        'avg_tokens': int((total_chars / successful_checks) / 4), # Rough estimate: 1 token ~ 4 chars
+        'sample_size': successful_checks
+    }
 
 # --- SCANNING STRATEGIES ---
 
@@ -190,7 +210,7 @@ def scan_sitemaps(sitemap_list, status):
 # --- MAIN ---
 
 def run_scan(url):
-    status = st.status("🚀 Starting...", expanded=True)
+    status = st.status("🚀 Starting Scan...", expanded=True)
     
     # 1. RSS
     rss_res = check_rss(url, status)
@@ -207,22 +227,24 @@ def run_scan(url):
         status.update(label="❌ No articles found in the last 3 days.", state="error")
         return None
     
-    status.update(label=f"✅ Done! Found {len(final)} articles.", state="complete")
+    status.update(label=f"✅ Scan Complete. Found {len(final)} articles.", state="complete")
     return final
 
 # --- UI ---
 
-st.set_page_config(page_title="3-Day News Scanner", layout="wide")
+st.set_page_config(page_title="3-Day News Analyzer", layout="wide")
 
-st.title("📅 3-Day News Scanner")
-st.write(f"Scans for articles from **{START_DATE.strftime('%Y-%m-%d')}** to **{(END_DATE - timedelta(seconds=1)).strftime('%Y-%m-%d')}**. Strictly ignores Tags.")
+st.title("📅 3-Day News Analyzer")
+st.write(f"Scans **{START_DATE.strftime('%Y-%m-%d')}** to **{(END_DATE - timedelta(seconds=1)).strftime('%Y-%m-%d')}**. Calculates volume & content depth.")
 
 url_input = st.text_input("Website URL", placeholder="https://lb.ua/")
 
-if st.button("Scan"):
+if st.button("Scan & Analyze"):
     if url_input:
         try:
+            # Phase 1: Scan for URLs
             res = run_scan(clean_url(url_input))
+            
             if res:
                 df = pd.DataFrame.from_dict(res, orient='index').reset_index()
                 df.columns = ['url', 'date', 'category']
@@ -234,15 +256,43 @@ if st.button("Scan"):
                 day2 = CURRENT_DATE - timedelta(days=2)
                 day3 = CURRENT_DATE - timedelta(days=3)
                 
-                c1, c2, c3, c4 = st.columns(4)
+                # Calculate Average
+                total_count = len(df)
+                avg_count = total_count / 3
+                
+                # Display Volume Metrics
+                st.subheader("📊 Article Volume")
+                c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric(f"{day1.strftime('%b %d')}", len(df[df['day'] == day1]))
                 c2.metric(f"{day2.strftime('%b %d')}", len(df[df['day'] == day2]))
                 c3.metric(f"{day3.strftime('%b %d')}", len(df[df['day'] == day3]))
-                c4.metric("Total", len(df))
+                c4.metric("Total", total_count)
+                c5.metric("Avg / Day", f"{avg_count:.1f}")
                 
-                with st.expander("View List"):
-                    st.dataframe(df.sort_values('date', ascending=False))
-                    st.download_button("Download", df.to_csv(index=False).encode('utf-8'), "news.csv", "text/csv")
+                st.divider()
+                
+                # Phase 2: Content Analysis
+                st.subheader("📝 Content Analysis (Sample)")
+                with st.spinner(f"Analyzing content of top {SAMPLE_SIZE} articles..."):
+                    # Get top 5 most recent
+                    sample_urls = df.sort_values('date', ascending=False).head(SAMPLE_SIZE)['url'].tolist()
+                    content_stats = analyze_content(sample_urls)
+                
+                if content_stats:
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Sample Size", content_stats['sample_size'])
+                    col2.metric("Avg Chars", content_stats['avg_chars'])
+                    col3.metric("Avg Words", content_stats['avg_words'])
+                    col4.metric("Est. Tokens", content_stats['avg_tokens'])
+                    st.caption("Note: 'Est. Tokens' is calculated as Characters / 4.")
+                else:
+                    st.warning("Could not extract content from the sample articles.")
+                
+                st.divider()
+                
+                with st.expander("View Full Article List"):
+                    st.dataframe(df.sort_values('date', ascending=False), use_container_width=True)
+                    st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "news.csv", "text/csv")
                     
         except Exception as e:
             st.error(f"Error: {e}")
