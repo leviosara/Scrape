@@ -9,11 +9,9 @@ from datetime import datetime, timedelta
 import feedparser
 
 # --- CONFIGURATION ---
-# Cutoff: Yesterday at Midnight (Strict Today + Yesterday)
 TODAY = datetime.now().date()
 YESTERDAY_START = datetime.combine(TODAY - timedelta(days=1), datetime.min.time())
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-# Increased limit for high volume sites like rayon.in.ua
 MAX_SITEMAPS = 50 
 
 # --- HELPER FUNCTIONS ---
@@ -42,27 +40,45 @@ def find_date_in_url(url):
 
 def is_real_article(url):
     """
-    CALIBRATED FILTER:
-    1. Block Homepage.
-    2. Block Blacklisted words (Tags, Categories).
-    3. DO NOT block based on URL depth (fixes lb.ua / devby.io issues).
+    CALIBRATED FILTER v2:
+    1. Check if the URL ends with a 'Category Word' (promo, city, news).
+       If yes -> DISCARD (It's a category page).
+    2. Check if it's the Homepage -> DISCARD.
+    3. Check extensions -> DISCARD.
     """
     url_lower = url.lower()
     parsed = urlparse(url)
+    path = parsed.path.rstrip('/')
     
-    # 1. Block Homepage
-    if parsed.path in ['', '/', '/index.php', '/index.html']:
+    # 1. Homepage Check
+    if not path or path == '/': 
         return False
 
-    # 2. Strict Blacklist
-    blacklist = [
-        '/tag/', '/tags/', '/author/', '/page/', '/category/', '/categories/', 
-        '/feed/', 'replytocom', '/edit', '/amp/', '/search/', '/filter/',
-        '.jpg', '.png', '.gif', '.pdf', '.css', '.js'
-    ]
-    if any(x in url_lower for x in blacklist):
+    # 2. Extension Check
+    bad_extensions = ['.jpg', '.png', '.gif', '.pdf', '.css', '.js', '.xml', '.zip']
+    if any(url_lower.endswith(ext) for ext in bad_extensions):
         return False
-        
+
+    # 3. Category Slug Check (The Fix)
+    # Get the last part of the URL
+    last_segment = path.split('/')[-1]
+    
+    # List of words that indicate a CATEGORY page, not an article
+    # Added 'promo', 'city' based on your feedback, plus standard news categories
+    forbidden_slugs = [
+        'promo', 'city', 'news', 'sport', 'science', 'politics', 'world', 
+        'society', 'economics', 'culture', 'life', 'style', 'video', 'photo',
+        'archive', 'archives', 'author', 'tags', 'tag', 'category', 'page',
+        'search', 'feed', 'rss', 'amp', 'ukraine', 'kyiv', 'contacts', 'about'
+    ]
+    
+    if last_segment in forbidden_slugs:
+        return False
+
+    # 4. Pagination Check
+    if 'page/' in url_lower or re.search(r'/page/\d+', url_lower):
+        return False
+
     return True
 
 def guess_category_from_url(sitemap_url):
@@ -126,17 +142,14 @@ def analyze_sitemap_index(index_url, status):
             
             if not loc: continue
 
-            # Logic: Keep if Priority Name OR Recently Updated
             is_priority = any(x in loc.lower() for x in ['news', 'post', 'sport', 'history', 'investig', 'article'])
             is_recent = False
             
             if lastmod:
                 mod_date = make_naive(dateparser.parse(lastmod))
-                # Expanded to 14 days window for sitemap updates to be safe
                 if mod_date and mod_date > (datetime.now() - timedelta(days=14)): 
                     is_recent = True
             
-            # If we can't tell, include it anyway (Safety First)
             if is_priority or is_recent or (not lastmod):
                 category = guess_category_from_url(loc)
                 sitemaps_to_scan.append((loc, category))
@@ -159,16 +172,14 @@ def scan_sitemap_file(sm_url, category, status):
                 if 'loc' in str(x.tag).lower(): url = x.text
                 if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
             
-            # Apply Calibrated Filter
+            # Apply Filter
             if url and is_real_article(url):
                 valid = False
                 
-                # A. Sitemap Date
                 if dt:
                     dt = make_naive(dt)
                     if dt > YESTERDAY_START: valid = True
                 
-                # B. URL Date (Fallback)
                 if not valid:
                     dt_url = find_date_in_url(url)
                     if dt_url:
@@ -205,7 +216,6 @@ def run_calibrated_scan(url):
     # 3. Deep Scan
     sitemap_res = {}
     if all_sitemaps:
-        # Limit to 50 sitemaps for high volume sites
         all_sitemaps = all_sitemaps[:MAX_SITEMAPS]
         status.update(label=f"🔎 Scanning {len(all_sitemaps)} Sitemap Sections...")
         
@@ -214,7 +224,7 @@ def run_calibrated_scan(url):
             part_res = scan_sitemap_file(sm_url, cat, status)
             sitemap_res.update(part_res)
             
-    # Combine: RSS overwrites Sitemap if duplicates
+    # Combine
     final_articles = {**sitemap_res, **rss_res}
     
     # Feedback
@@ -230,9 +240,9 @@ def run_calibrated_scan(url):
 st.set_page_config(page_title="Calibrated News Scanner", layout="wide")
 
 st.title("🎯 Calibrated News Scanner")
-st.write(f"Optimized for reference sites (lb.ua, rayon.in.ua, etc). Strict Today/Yesterday count.")
+st.write(f"Excludes category pages (promo, city, news folders). Strict Today/Yesterday count.")
 
-url_input = st.text_input("Website URL", placeholder="https://lb.ua/")
+url_input = st.text_input("Website URL", placeholder="https://cukr.city/")
 
 if st.button("Run Calibrated Scan"):
     if url_input:
