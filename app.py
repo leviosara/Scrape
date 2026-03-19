@@ -1,6 +1,6 @@
 import streamlit as st
 import requests
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 import pandas as pd
 import dateparser
@@ -27,24 +27,31 @@ def clean_url(url):
 
 def normalize_url(url):
     """
-    Standardizes URLs to prevent duplicates.
-    1. Lowercase host.
-    2. Remove 'www.'
-    3. Strip query parameters (?ref=...) and fragments (#...).
-    4. Remove trailing slash.
+    Advanced Deduplication:
+    1. Extracts Article ID (e.g., -12345.html). If found, uses ID as key.
+    2. If no ID, removes 'www', language prefixes (/uk/, /en/), and query params.
     """
     try:
         parsed = urlparse(url)
-        # Lowercase netloc, remove www
         netloc = parsed.netloc.lower()
         if netloc.startswith('www.'):
             netloc = netloc[4:]
         
-        # Reconstruct without params/query/fragment
-        # scheme://netloc/path
-        clean_path = parsed.path.rstrip('/')
+        path = parsed.path.rstrip('/')
+
+        # STRATEGY 1: Unique ID Extraction (Crucial for NV.ua, etc.)
+        # Matches numbers typically found at the end of news URLs (5+ digits)
+        match = re.search(r'(\d{5,})', path)
+        if match:
+            # Return a key based purely on domain + article ID
+            return f"{netloc}::id_{match.group(1)}"
+
+        # STRATEGY 2: Language/Path Normalization
+        # Remove common language prefixes if no ID found
+        path = re.sub(r'^/(uk|ru|en|ua|ukr|rus|eng|pol)/', '/', path)
         
-        return f"{parsed.scheme}://{netloc}{clean_path}"
+        # Return domain + cleaned path
+        return f"{netloc}{path}"
     except:
         return url
 
@@ -73,7 +80,6 @@ def is_real_article(url):
     if any(url_lower.endswith(ext) for ext in ['.jpg', '.png', '.gif', '.pdf', '.css', '.js', '.xml', '.zip']):
         return False
     
-    # Strict Tag/Topic Filter
     if any(x in path for x in ['/tag/', '/tags/', '/topic/', '/label/']):
         return False
 
@@ -89,7 +95,6 @@ def is_real_article(url):
     return True
 
 def analyze_content(urls):
-    """Downloads and analyzes a sample of URLs for character/token counts."""
     total_chars = 0
     total_words = 0
     successful_checks = 0
@@ -110,7 +115,7 @@ def analyze_content(urls):
     return {
         'avg_chars': int(total_chars / successful_checks),
         'avg_words': int(total_words / successful_checks),
-        'avg_tokens': int((total_chars / successful_checks) / 4), # 1 token ~ 4 chars
+        'avg_tokens': int((total_chars / successful_checks) / 4),
         'sample_size': successful_checks
     }
 
@@ -138,7 +143,7 @@ def check_rss(base_url, status):
                             link_norm = normalize_url(link)
                             
                             if START_DATE <= dt < END_DATE and is_real_article(link_norm):
-                                found[link_norm] = {'date': dt, 'category': 'RSS Feed'}
+                                found[link_norm] = {'date': dt, 'category': 'RSS Feed', 'original_url': link}
                     if found:
                         status.write(f"✅ RSS: Found {len(found)}.")
                         return found
@@ -211,27 +216,29 @@ def scan_sitemaps(sitemap_list, status):
                     if 'loc' in str(x.tag).lower(): url = x.text
                     if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
                 
-                # NORMALIZE URL HERE
-                if url: url_norm = normalize_url(url)
+                if url:
+                    # NORMALIZE URL HERE
+                    url_norm = normalize_url(url)
                 
-                if url_norm and is_real_article(url_norm):
-                    valid = False
-                    
-                    if dt:
-                        dt = make_naive(dt)
-                        if START_DATE <= dt < END_DATE: valid = True
-                    
-                    if not valid:
-                        dt_url = find_date_in_url(url_norm)
-                        if dt_url:
-                            dt_url = make_naive(dt_url)
-                            if START_DATE <= dt_url < END_DATE:
-                                dt = dt_url
-                                valid = True
-                    
-                    if valid and dt:
-                        cat = sm_url.split('/')[-1].replace('.xml', '').replace('-', ' ').title()
-                        found[url_norm] = {'date': dt, 'category': cat}
+                    if url_norm and is_real_article(url_norm):
+                        valid = False
+                        
+                        if dt:
+                            dt = make_naive(dt)
+                            if START_DATE <= dt < END_DATE: valid = True
+                        
+                        if not valid:
+                            dt_url = find_date_in_url(url_norm)
+                            if dt_url:
+                                dt_url = make_naive(dt_url)
+                                if START_DATE <= dt_url < END_DATE:
+                                    dt = dt_url
+                                    valid = True
+                        
+                        if valid and dt:
+                            cat = sm_url.split('/')[-1].replace('.xml', '').replace('-', ' ').title()
+                            # Store original URL for display, but key is normalized
+                            found[url_norm] = {'date': dt, 'category': cat, 'original_url': url}
                         
         except: continue
             
@@ -242,15 +249,13 @@ def scan_sitemaps(sitemap_list, status):
 def run_scan(url):
     status = st.status("🚀 Starting Scan...", expanded=True)
     
-    # 1. RSS
     rss_res = check_rss(url, status)
     
-    # 2. Sitemaps
     domain = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
     sitemaps = get_sitemaps_to_scan(domain, status)
     sitemap_res = scan_sitemaps(sitemaps, status)
     
-    # Combine (Dictionary keys are unique, so this deduplicates automatically)
+    # Combine (Keys are now smart-normalized IDs)
     final = {**sitemap_res, **rss_res}
     
     if not final:
@@ -264,20 +269,28 @@ def run_scan(url):
 
 st.set_page_config(page_title="3-Day News Analyzer", layout="wide")
 
-st.title("📅 3-Day News Analyzer (Deduplicated)")
-st.write(f"Scans **{START_DATE.strftime('%Y-%m-%d')}** to **{(END_DATE - timedelta(seconds=1)).strftime('%Y-%m-%d')}**. Removes duplicates.")
+st.title("📅 3-Day News Analyzer (Smart Deduplication)")
+st.write(f"Detects **Article IDs** to prevent duplicates across languages (e.g., NV.ua).")
 
-url_input = st.text_input("Website URL", placeholder="https://lb.ua/")
+url_input = st.text_input("Website URL", placeholder="https://nv.ua")
 
 if st.button("Scan & Analyze"):
     if url_input:
         try:
-            # Phase 1: Scan for URLs
             res = run_scan(clean_url(url_input))
             
             if res:
-                df = pd.DataFrame.from_dict(res, orient='index').reset_index()
-                df.columns = ['url', 'date', 'category']
+                # Prepare DataFrame
+                data = []
+                for key, val in res.items():
+                    data.append({
+                        'normalized_key': key,
+                        'url': val.get('original_url', key), # Keep one original URL for display
+                        'date': val['date'],
+                        'category': val['category']
+                    })
+                
+                df = pd.DataFrame(data)
                 df['date'] = pd.to_datetime(df['date'])
                 df['day'] = df['date'].dt.date
                 
@@ -304,11 +317,11 @@ if st.button("Scan & Analyze"):
                 # Phase 2: Content Analysis
                 st.subheader("📝 Content Analysis")
                 with st.spinner(f"Analyzing content of top {SAMPLE_SIZE} articles..."):
+                    # Use the preserved original URLs for content analysis
                     sample_urls = df.sort_values('date', ascending=False).head(SAMPLE_SIZE)['url'].tolist()
                     content_stats = analyze_content(sample_urls)
                 
                 if content_stats:
-                    # Calculate Avg Tokens Per Day
                     avg_tokens_day = int(avg_articles_day * content_stats['avg_tokens'])
                     
                     col1, col2, col3, col4 = st.columns(4)
@@ -317,14 +330,14 @@ if st.button("Scan & Analyze"):
                     col3.metric("Avg Tokens / DAY", avg_tokens_day)
                     col4.metric("Sample Size", content_stats['sample_size'])
                     
-                    st.caption("Calculated as: (Avg Articles/Day) × (Avg Tokens/Article). 1 Token ≈ 4 chars.")
+                    st.caption("Deduplication Logic: IDs extracted (e.g. '50592881') or Language Prefixes stripped.")
                 else:
                     st.warning("Could not extract content from the sample articles.")
                 
                 st.divider()
                 
                 with st.expander("View Full Article List"):
-                    st.dataframe(df.sort_values('date', ascending=False), use_container_width=True)
+                    st.dataframe(df[['date', 'url', 'category']].sort_values('date', ascending=False), use_container_width=True)
                     st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "news.csv", "text/csv")
                     
         except Exception as e:
