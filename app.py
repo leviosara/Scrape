@@ -9,15 +9,18 @@ from datetime import datetime, timedelta
 import feedparser
 
 # --- CONFIGURATION ---
-TODAY = datetime.now().date()
-YESTERDAY_START = datetime.combine(TODAY - timedelta(days=1), datetime.min.time())
+CURRENT_DATE = datetime.now().date()
+# Window: Start from 3 days ago (00:00:00)
+START_DATE = datetime.combine(CURRENT_DATE - timedelta(days=3), datetime.min.time())
+# Window: End at the start of today (00:00:00) - effectively excluding today
+END_DATE = datetime.combine(CURRENT_DATE, datetime.min.time())
+
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 
 # --- HELPER FUNCTIONS ---
 
 def clean_url(url):
     url = url.strip()
-    # Keep http if user typed it, otherwise assume https
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
     return url.rstrip('/')
@@ -49,13 +52,20 @@ def is_real_article(url):
     if any(url_lower.endswith(ext) for ext in ['.jpg', '.png', '.gif', '.pdf', '.css', '.js', '.xml', '.zip']):
         return False
 
-    # 2. Category Words
+    # 2. STRICT TAG FILTER
+    # If the path contains '/tag/' or '/tags/', it is NOT an article.
+    # Also blocking 'topic' and 'label' which are common synonyms for tags.
+    if any(x in path for x in ['/tag/', '/tags/', '/topic/', '/label/']):
+        return False
+
+    # 3. Category Words (Last segment check)
     last_segment = path.split('/')[-1]
     forbidden_slugs = [
         'promo', 'city', 'news', 'sport', 'science', 'politics', 'world', 
         'society', 'economics', 'culture', 'life', 'style', 'video', 'photo',
-        'archive', 'archives', 'author', 'tags', 'tag', 'category', 'page',
-        'search', 'feed', 'rss', 'amp', 'ukraine', 'kyiv', 'contacts', 'about'
+        'archive', 'archives', 'author', 'category', 'page',
+        'search', 'feed', 'rss', 'amp', 'ukraine', 'kyiv', 'contacts', 'about',
+        'tag', 'tags', 'topic', 'label'
     ]
     if last_segment in forbidden_slugs: return False
 
@@ -80,7 +90,7 @@ def check_rss(base_url, status):
                         if link and published:
                             dt = datetime(*published[:6])
                             dt = make_naive(dt)
-                            if dt > YESTERDAY_START and is_real_article(link):
+                            if START_DATE <= dt < END_DATE and is_real_article(link):
                                 found[link] = {'date': dt, 'category': 'RSS Feed'}
                     if found:
                         status.write(f"✅ RSS: Found {len(found)}.")
@@ -89,8 +99,7 @@ def check_rss(base_url, status):
     return found
 
 def get_sitemaps_to_scan(domain, status):
-    """Finds sitemap files, but ONLY keeps those updated recently."""
-    status.write("📡 Step 2: Filtering Sitemaps (Speed Boost)...")
+    status.write("📡 Step 2: Filtering Sitemaps...")
     index_paths = [f"{domain}/sitemap.xml", f"{domain}/sitemap_index.xml"]
     valid_sitemaps = []
     
@@ -101,12 +110,10 @@ def get_sitemaps_to_scan(domain, status):
             
             root = ET.fromstring(r.content)
             
-            # Case 1: It's a single big sitemap
             if 'urlset' in str(root.tag).lower():
                 valid_sitemaps.append(path)
                 break
             
-            # Case 2: It's an index (list of sitemaps)
             if 'sitemapindex' in str(root.tag).lower():
                 for child in root:
                     loc = None
@@ -118,12 +125,10 @@ def get_sitemaps_to_scan(domain, status):
                     
                     if not loc: continue
                     
-                    # OPTIMIZATION: Check the date of the SITEMAP file itself
-                    # If the sitemap file wasn't updated in 3 days, skip it.
                     skip = False
                     if lastmod:
                         mod_dt = make_naive(dateparser.parse(lastmod))
-                        if mod_dt and mod_dt < (datetime.now() - timedelta(days=3)):
+                        if mod_dt and mod_dt < (datetime.now() - timedelta(days=5)):
                             skip = True
                     
                     if not skip:
@@ -131,18 +136,16 @@ def get_sitemaps_to_scan(domain, status):
                 break
         except: continue
 
-    # Fallback: If filtering removed everything, just try the main one
     if not valid_sitemaps:
         valid_sitemaps.append(f"{domain}/sitemap.xml")
         
     return valid_sitemaps
 
 def scan_sitemaps(sitemap_list, status):
-    status.write(f"🔎 Step 3: Scanning {len(sitemap_list)} relevant sitemaps...")
+    status.write(f"🔎 Step 3: Scanning {len(sitemap_list)} sitemaps...")
     found = {}
     
     for i, sm_url in enumerate(sitemap_list):
-        # Safety limit
         if i > 25: break 
         
         status.write(f"   Scanning: {sm_url.split('/')[-1]}...")
@@ -166,13 +169,13 @@ def scan_sitemaps(sitemap_list, status):
                     
                     if dt:
                         dt = make_naive(dt)
-                        if dt > YESTERDAY_START: valid = True
+                        if START_DATE <= dt < END_DATE: valid = True
                     
                     if not valid:
                         dt_url = find_date_in_url(url)
                         if dt_url:
                             dt_url = make_naive(dt_url)
-                            if dt_url > YESTERDAY_START:
+                            if START_DATE <= dt_url < END_DATE:
                                 dt = dt_url
                                 valid = True
                     
@@ -201,7 +204,7 @@ def run_scan(url):
     final = {**sitemap_res, **rss_res}
     
     if not final:
-        status.update(label="❌ No articles found.", state="error")
+        status.update(label="❌ No articles found in the last 3 days.", state="error")
         return None
     
     status.update(label=f"✅ Done! Found {len(final)} articles.", state="complete")
@@ -209,10 +212,10 @@ def run_scan(url):
 
 # --- UI ---
 
-st.set_page_config(page_title="Reliable News Scanner", layout="wide")
+st.set_page_config(page_title="3-Day News Scanner", layout="wide")
 
-st.title("🛡️ Reliable News Scanner")
-st.write("Optimized to skip old sitemap files. Accurate counting for Today & Yesterday.")
+st.title("📅 3-Day News Scanner")
+st.write(f"Scans for articles from **{START_DATE.strftime('%Y-%m-%d')}** to **{(END_DATE - timedelta(seconds=1)).strftime('%Y-%m-%d')}**. Strictly ignores Tags.")
 
 url_input = st.text_input("Website URL", placeholder="https://lb.ua/")
 
@@ -226,10 +229,16 @@ if st.button("Scan"):
                 df['date'] = pd.to_datetime(df['date'])
                 df['day'] = df['date'].dt.date
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Today", len(df[df['day'] == TODAY]))
-                c2.metric("Yesterday", len(df[df['day'] == TODAY - timedelta(days=1)]))
-                c3.metric("Total", len(df))
+                # Calculate Dates
+                day1 = CURRENT_DATE - timedelta(days=1)
+                day2 = CURRENT_DATE - timedelta(days=2)
+                day3 = CURRENT_DATE - timedelta(days=3)
+                
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric(f"{day1.strftime('%b %d')}", len(df[df['day'] == day1]))
+                c2.metric(f"{day2.strftime('%b %d')}", len(df[df['day'] == day2]))
+                c3.metric(f"{day3.strftime('%b %d')}", len(df[df['day'] == day3]))
+                c4.metric("Total", len(df))
                 
                 with st.expander("View List"):
                     st.dataframe(df.sort_values('date', ascending=False))
