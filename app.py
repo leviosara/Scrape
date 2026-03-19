@@ -1,6 +1,6 @@
 import streamlit as st
 import requests
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 import xml.etree.ElementTree as ET
 import pandas as pd
 import dateparser
@@ -15,7 +15,7 @@ START_DATE = datetime.combine(CURRENT_DATE - timedelta(days=3), datetime.min.tim
 END_DATE = datetime.combine(CURRENT_DATE, datetime.min.time())
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-SAMPLE_SIZE = 5  # How many articles to check for content stats
+SAMPLE_SIZE = 5
 
 # --- HELPER FUNCTIONS ---
 
@@ -24,6 +24,29 @@ def clean_url(url):
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
     return url.rstrip('/')
+
+def normalize_url(url):
+    """
+    Standardizes URLs to prevent duplicates.
+    1. Lowercase host.
+    2. Remove 'www.'
+    3. Strip query parameters (?ref=...) and fragments (#...).
+    4. Remove trailing slash.
+    """
+    try:
+        parsed = urlparse(url)
+        # Lowercase netloc, remove www
+        netloc = parsed.netloc.lower()
+        if netloc.startswith('www.'):
+            netloc = netloc[4:]
+        
+        # Reconstruct without params/query/fragment
+        # scheme://netloc/path
+        clean_path = parsed.path.rstrip('/')
+        
+        return f"{parsed.scheme}://{netloc}{clean_path}"
+    except:
+        return url
 
 def make_naive(dt):
     if dt is None: return None
@@ -87,7 +110,7 @@ def analyze_content(urls):
     return {
         'avg_chars': int(total_chars / successful_checks),
         'avg_words': int(total_words / successful_checks),
-        'avg_tokens': int((total_chars / successful_checks) / 4), # Rough estimate: 1 token ~ 4 chars
+        'avg_tokens': int((total_chars / successful_checks) / 4), # 1 token ~ 4 chars
         'sample_size': successful_checks
     }
 
@@ -110,8 +133,12 @@ def check_rss(base_url, status):
                         if link and published:
                             dt = datetime(*published[:6])
                             dt = make_naive(dt)
-                            if START_DATE <= dt < END_DATE and is_real_article(link):
-                                found[link] = {'date': dt, 'category': 'RSS Feed'}
+                            
+                            # NORMALIZE URL HERE
+                            link_norm = normalize_url(link)
+                            
+                            if START_DATE <= dt < END_DATE and is_real_article(link_norm):
+                                found[link_norm] = {'date': dt, 'category': 'RSS Feed'}
                     if found:
                         status.write(f"✅ RSS: Found {len(found)}.")
                         return found
@@ -184,7 +211,10 @@ def scan_sitemaps(sitemap_list, status):
                     if 'loc' in str(x.tag).lower(): url = x.text
                     if 'lastmod' in str(x.tag).lower(): dt = dateparser.parse(x.text)
                 
-                if url and is_real_article(url):
+                # NORMALIZE URL HERE
+                if url: url_norm = normalize_url(url)
+                
+                if url_norm and is_real_article(url_norm):
                     valid = False
                     
                     if dt:
@@ -192,7 +222,7 @@ def scan_sitemaps(sitemap_list, status):
                         if START_DATE <= dt < END_DATE: valid = True
                     
                     if not valid:
-                        dt_url = find_date_in_url(url)
+                        dt_url = find_date_in_url(url_norm)
                         if dt_url:
                             dt_url = make_naive(dt_url)
                             if START_DATE <= dt_url < END_DATE:
@@ -201,7 +231,7 @@ def scan_sitemaps(sitemap_list, status):
                     
                     if valid and dt:
                         cat = sm_url.split('/')[-1].replace('.xml', '').replace('-', ' ').title()
-                        found[url] = {'date': dt, 'category': cat}
+                        found[url_norm] = {'date': dt, 'category': cat}
                         
         except: continue
             
@@ -220,22 +250,22 @@ def run_scan(url):
     sitemaps = get_sitemaps_to_scan(domain, status)
     sitemap_res = scan_sitemaps(sitemaps, status)
     
-    # Combine
+    # Combine (Dictionary keys are unique, so this deduplicates automatically)
     final = {**sitemap_res, **rss_res}
     
     if not final:
         status.update(label="❌ No articles found in the last 3 days.", state="error")
         return None
     
-    status.update(label=f"✅ Scan Complete. Found {len(final)} articles.", state="complete")
+    status.update(label=f"✅ Scan Complete. Found {len(final)} unique articles.", state="complete")
     return final
 
 # --- UI ---
 
 st.set_page_config(page_title="3-Day News Analyzer", layout="wide")
 
-st.title("📅 3-Day News Analyzer")
-st.write(f"Scans **{START_DATE.strftime('%Y-%m-%d')}** to **{(END_DATE - timedelta(seconds=1)).strftime('%Y-%m-%d')}**. Calculates volume & content depth.")
+st.title("📅 3-Day News Analyzer (Deduplicated)")
+st.write(f"Scans **{START_DATE.strftime('%Y-%m-%d')}** to **{(END_DATE - timedelta(seconds=1)).strftime('%Y-%m-%d')}**. Removes duplicates.")
 
 url_input = st.text_input("Website URL", placeholder="https://lb.ua/")
 
@@ -256,35 +286,38 @@ if st.button("Scan & Analyze"):
                 day2 = CURRENT_DATE - timedelta(days=2)
                 day3 = CURRENT_DATE - timedelta(days=3)
                 
-                # Calculate Average
+                # Calculate Volume
                 total_count = len(df)
-                avg_count = total_count / 3
+                avg_articles_day = total_count / 3
                 
                 # Display Volume Metrics
-                st.subheader("📊 Article Volume")
+                st.subheader("📊 Article Volume (Unique)")
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric(f"{day1.strftime('%b %d')}", len(df[df['day'] == day1]))
                 c2.metric(f"{day2.strftime('%b %d')}", len(df[df['day'] == day2]))
                 c3.metric(f"{day3.strftime('%b %d')}", len(df[df['day'] == day3]))
                 c4.metric("Total", total_count)
-                c5.metric("Avg / Day", f"{avg_count:.1f}")
+                c5.metric("Avg / Day", f"{avg_articles_day:.1f}")
                 
                 st.divider()
                 
                 # Phase 2: Content Analysis
-                st.subheader("📝 Content Analysis (Sample)")
+                st.subheader("📝 Content Analysis")
                 with st.spinner(f"Analyzing content of top {SAMPLE_SIZE} articles..."):
-                    # Get top 5 most recent
                     sample_urls = df.sort_values('date', ascending=False).head(SAMPLE_SIZE)['url'].tolist()
                     content_stats = analyze_content(sample_urls)
                 
                 if content_stats:
+                    # Calculate Avg Tokens Per Day
+                    avg_tokens_day = int(avg_articles_day * content_stats['avg_tokens'])
+                    
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Sample Size", content_stats['sample_size'])
-                    col2.metric("Avg Chars", content_stats['avg_chars'])
-                    col3.metric("Avg Words", content_stats['avg_words'])
-                    col4.metric("Est. Tokens", content_stats['avg_tokens'])
-                    st.caption("Note: 'Est. Tokens' is calculated as Characters / 4.")
+                    col1.metric("Avg Article Length", f"{content_stats['avg_words']} words")
+                    col2.metric("Avg Tokens / Article", content_stats['avg_tokens'])
+                    col3.metric("Avg Tokens / DAY", avg_tokens_day)
+                    col4.metric("Sample Size", content_stats['sample_size'])
+                    
+                    st.caption("Calculated as: (Avg Articles/Day) × (Avg Tokens/Article). 1 Token ≈ 4 chars.")
                 else:
                     st.warning("Could not extract content from the sample articles.")
                 
